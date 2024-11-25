@@ -1,0 +1,11 @@
+[Unit]
+Description=Timer for Running Python Script Every Six Hours
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+
