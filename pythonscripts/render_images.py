@@ -5,6 +5,8 @@ import pygrib
 import pandas as pd
 import requests
 import os
+from scipy.ndimage import gaussian_filter
+import numpy as np
 
 # Constants for Mercator projection
 TILE_SIZE = 256  # Each tile is 256x256 pixels
@@ -48,6 +50,83 @@ def generate_tile(data, zoom, x_tile, y_tile):
             draw.ellipse((px - size, py - size, px + size, py + size), fill=(255, 0, 0, 128))
 
     return image
+
+
+def generate_gaussian_tile(data, x_tile, y_tile, zoom=12, sigma=8):
+    """
+    Generate a PNG by applying a Gaussian filter to wave height data distributed over lat/lon coordinates
+    """
+    
+    # Calculate tile boundaries
+    n = 2 ** zoom
+   #  lon_min = x_tile / n * 360.0 - 180.0
+   #  lon_max = (x_tile + 1) / n * 360.0 - 180.0
+   #  lat_min = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y_tile / n))))
+   #  lat_max = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (y_tile + 1) / n))))
+   #  lon_min = min(data["longitude"])
+   #  lon_max = max(data["longitude"]) 
+   #  dx = 10
+   #  # dx = (lon_max - lon_min) / zoom 
+   #  lat_min = min(data["latitude"])
+   #  lat_max = max(data["latitude"])
+   #  dy = 10
+    # dy = (lat_max - lat_min) / zoom 
+
+   #  image_min_lon = lon_min + dx * x_tile
+   #  image_max_lon = lon_min + dx * (x_tile + 1)
+   #  image_min_lat = lat_min + dy * (y_tile)
+   #  image_max_lat = lat_min + dy * (y_tile + 1)
+    image_min_lon = x_tile
+    image_max_lon = x_tile + 1
+    image_min_lat = y_tile
+    image_max_lat = y_tile + 1
+
+    # Filter data to tile bounds
+    mask = (data['longitude'] >= image_min_lon) & (data['longitude'] <= image_max_lon) & \
+           (data['latitude'] >= image_min_lat) & (data['latitude'] <= image_max_lat)
+    tile_data = data[mask]
+
+    if len(tile_data) == 0:
+        return Image.new("RGBA", (TILE_SIZE, TILE_SIZE), (255, 255, 255, 0))
+
+    # Create grid
+    grid_size = TILE_SIZE
+    lon_grid = np.linspace(image_min_lon, image_max_lon, grid_size)
+    lat_grid = np.linspace(image_max_lat, image_min_lat, grid_size)  # Reversed for image coordinates
+    grid = np.zeros((grid_size, grid_size))
+
+    # Map data points to grid
+    for _, row in tile_data.iterrows():
+        x = int((row['longitude'] - image_min_lon) / (image_max_lon - image_min_lon) * (grid_size - 1))
+        y = int((image_max_lat - row['latitude']) / (image_max_lat - image_min_lat) * (grid_size - 1))
+        if 0 <= x < grid_size and 0 <= y < grid_size:
+            grid[y, x] = row['wave_height']
+
+    # print("tile data: \n")
+    # print(tile_data)
+    # Apply Gaussian filter
+    smoothed = gaussian_filter(grid, sigma=sigma)
+    
+    # Normalize to 0-255 range for visualization
+    if smoothed.max() > smoothed.min():
+        normalized = ((smoothed - smoothed.min()) * 255 / (smoothed.max() - smoothed.min())).astype(np.uint8)
+    else:
+        normalized = np.zeros_like(smoothed, dtype=np.uint8)
+
+    # Create image
+    image = Image.new("RGBA", (TILE_SIZE, TILE_SIZE), (255, 255, 255, 0))
+    for y in range(grid_size):
+        for x in range(grid_size):
+            val = normalized[y, x]
+            # Create a heatmap-style coloring (you can adjust the color scheme)
+            image.putpixel((x, y), (val, 0, 255-val, 128))
+
+    return image
+
+
+
+
+
 
 def save_tile(image, zoom, x_tile, y_tile, output_dir):
     """
@@ -117,27 +196,40 @@ for i in range(1, 2): # forecasting 48 hours ahead
     else:
         i = f"{i}"
     # url = f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/gfs.20241124/18/wave/gridded/gfswave.t00z.epacif.0p16.f{i}.grib2"
-    url = f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/gfs.20241124/18/wave/gridded/gfswave.t18z.wcoast.0p16.f056.grib2"
+    # url = f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/gfs.20241124/18/wave/gridded/gfswave.t18z.wcoast.0p16.f056.grib2"
 
-    response = requests.get(url)
-    response.raise_for_status()  # This will raise an exception if there was an error downloading the file
-
-    print(f"File {i} downloaded successfully")
-    file_path = f"gfswave.t00z.epacif.9km.f{i}.grib2"
-
-    with open(file_path, "wb") as file:
-        file.write(response.content)
+    file_path = f"gfswave.t00z.global.9km.f{i}.grib2"
+    # Check if file already exists
+    if not os.path.exists(file_path):
+        url = f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/gfs.20241124/18/wave/gridded/gfswave.t18z.global.0p16.f020.grib2"
+        print(f"Downloading file {file_path}...")
+        response = requests.get(url)
+        response.raise_for_status()  # This will raise an exception if there was an error downloading the file
+        
+        with open(file_path, "wb") as file:
+            file.write(response.content)
+        print(f"File {i} downloaded successfully")
+    else:
+        print(f"File {file_path} already exists, skipping download")
 
     d = pd.DataFrame(extract_from_grib2(file_path))
     print(d)
 
-    # render and save tiles
-    zoom = 12
+    zoom = 1 
     output_dir = "./tiles"
-    for x_tile in range(0, 2 ** zoom):  # Adjust ranges for zoom level and data coverage
-        for y_tile in range(0, 2 ** zoom):
-            tile_image = generate_tile(d, zoom, x_tile, y_tile)
-            save_tile(tile_image, zoom, x_tile, y_tile, output_dir)
+   #  for x_tile in range(0, 2 ** zoom):  # Adjust ranges for zoom level and data coverage
+   #      for y_tile in range(0, 2 ** zoom):
+   #          # Generate both regular and gaussian filtered tiles
+   #          tile_image = generate_gaussian_tile(d, x_tile, y_tile, zoom)
+   #          save_tile(tile_image, zoom, x_tile, y_tile, output_dir + "_gaussian")
+
+    # render and save tiles
+    for x_tile in range(0, 18): 
+        for y_tile in range(-1, 2): 
+            tile_image = generate_gaussian_tile(d, x_tile * 20, y_tile * 20, zoom)
+            save_tile(tile_image, zoom, x_tile, y_tile, output_dir + "_gaussian")
+    print(f"finished rendering tiles for file {i}")
+
 
     # df = pd.concat([df, d], ignore_index=True)
 
