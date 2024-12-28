@@ -45,7 +45,7 @@ def extract_from_grib2(filepath):
 conn = psycopg2.connect(
     dbname="wave_forecast",
     user="postgres",          # Replace with your username
-    password="jayhawks",  # Replace with your password
+    password="psql_pw",  # Replace with your password
     host="localhost",
     port="5432"
 )
@@ -59,7 +59,8 @@ for i in range(1, 24):
         i = f"0{i}"
     else:
         i = f"{i}"
-    url = f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/gfs.20241124/18/wave/gridded/gfswave.t18z.wcoast.0p16.f{i}.grib2"
+
+    url = f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/gfs.20241219/18/wave/gridded/gfswave.t18z.wcoast.0p16.f{i}.grib2"
 
     response = requests.get(url)
     response.raise_for_status()
@@ -78,11 +79,11 @@ for i in range(1, 24):
             VALUES (%s, %s, %s, %s, ST_SetSRID(ST_MakePoint(%s, %s), 4326));
         """, (
             entry['datetime'],
-            entry['wave_height'],
-            entry['wave_period'],
-            entry['wave_direction'],
-            entry['longitude'],
-            entry['latitude']
+            float(entry['wave_height']),
+            float(entry['wave_period']),
+            float(entry['wave_direction']),
+            float(entry['longitude']),
+            float(entry['latitude'])
         ))
 
     conn.commit()
