@@ -12,5 +12,3 @@ sudo systemctl daemon-reload
 sudo systemctl enable my_python_script.timer
 sudo systemctl start my_python_script.timer
 ```
-
-
