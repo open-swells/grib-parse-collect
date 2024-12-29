@@ -246,9 +246,7 @@ def calculate_contours(csv_path, geojson_path, resolution=(180, 90), num_levels=
 
 
 # Main processing
-for i in range(1, 12):
-    if i >= 2: 
-        break
+for i in range(0, 24):
     file_index = f"{i:03}"  # Format index with leading zeros
     file_path = f"gfswave.t00z.global.9km.f{file_index}.grib2"
     csv_path = f"wave_data_{file_index}.csv"
@@ -256,7 +254,7 @@ for i in range(1, 12):
     shp_file_path = f"./land/ne_10m_land.shp"
 
     if not os.path.exists(file_path):
-        url = f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/gfs.20241219/18/wave/gridded/gfswave.t18z.global.0p16.f{file_index}.grib2"
+        url = f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/gfs.20241220/18/wave/gridded/gfswave.t18z.global.0p16.f{file_index}.grib2"
         response = requests.get(url)
         response.raise_for_status()
 
