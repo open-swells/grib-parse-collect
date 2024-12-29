@@ -12,6 +12,8 @@ from shapely.ops import unary_union
 from scipy.interpolate import griddata
 import geojson
 
+import time
+
 
 def extract_from_grib2(filepath):
     grbs = pygrib.open(filepath)
@@ -50,6 +52,46 @@ def extract_from_grib2(filepath):
                     })
     return wave_height_data
 
+def extract_from_grib2_to_np(filepath):
+    grbs = pygrib.open(filepath)
+    height_param_name = 'Significant height of total swell'
+    period_param_name = 'Mean period of total swell'
+    direction_param_name = 'Direction of swell waves'
+
+    height_messages = grbs.select(name=height_param_name)
+    period_messages = grbs.select(name=period_param_name)
+    direction_messages = grbs.select(name=direction_param_name)
+
+    # We'll only process the first message (timestamp) for now
+    height_msg = height_messages[0]
+    period_msg = period_messages[0]
+    direction_msg = direction_messages[0]
+
+    if height_msg.validDate == period_msg.validDate == direction_msg.validDate:
+        date = height_msg.validDate
+        lats, lons = height_msg.latlons()
+        height_data = height_msg.values
+        period_data = period_msg.values
+        direction_data = direction_msg.values
+
+        # Create mask for valid (non-masked) data points
+        valid_mask = np.logical_not(np.ma.getmask(height_data))
+        
+        # Get the number of valid points
+        n_valid = np.sum(valid_mask)
+        
+        # Create output arrays
+        out_lats = lats[valid_mask]
+        out_lons = lons[valid_mask]
+        out_heights = height_data[valid_mask]
+        out_periods = period_data[valid_mask]
+        out_directions = direction_data[valid_mask]
+        
+        # Stack all arrays horizontally
+        return np.column_stack((out_lons, out_lats, out_heights, out_periods, out_directions))
+    
+    return np.array([])  # Return empty array if no valid data
+
 def save_to_csv(data, csv_path):
     # Write the data to a CSV file
     with open(csv_path, mode='w', newline='') as csvfile:
@@ -59,8 +101,7 @@ def save_to_csv(data, csv_path):
     print(f"Data saved to {csv_path}")
 
 
-
-def calculate_contours3(csv_path, geojson_path, resolution=(30, 15)):
+def calculate_contours4(data, geojson_path, resolution=(30, 15)):
     """
     Calculate contours with reduced resolution and fewer levels.
     Args:
@@ -69,14 +110,12 @@ def calculate_contours3(csv_path, geojson_path, resolution=(30, 15)):
         geojson_path: Path to the output GeoJSON file with contour polygons.
         resolution: Tuple (# of longitude bins, # of latitude bins).
     """
-    # 1. Read CSV data
+    # 1. read data
     lons, lats, heights = [], [], []
-    with open(csv_path, mode='r') as csvfile:
-        reader = csv.DictReader(csvfile)
-        for row in reader:
-            lons.append(float(row['longitude']))
-            lats.append(float(row['latitude']))
-            heights.append(float(row['wave_height']))
+    lons = data[:, 0]
+    lats = data[:, 1]
+    heights = data[:, 2]
+
 
     # 2. Prepare grid
     min_lon, max_lon = min(lons), max(lons)
@@ -85,13 +124,23 @@ def calculate_contours3(csv_path, geojson_path, resolution=(30, 15)):
     lat_bins = np.linspace(min_lat, max_lat, resolution[1])
     lon_grid, lat_grid = np.meshgrid(lon_bins, lat_bins)
 
-    # 3. Interpolate data onto grid
-    z_grid = griddata(
-        (lons, lats), heights,
-        (lon_grid, lat_grid),
-        method='linear',
-        fill_value=np.nan
-    )
+    # 3. Bin data directly into grid (no interpolation)
+    z_grid = np.full(lon_grid.shape, np.nan)  # Initialize with NaN
+    height_sum = np.zeros_like(z_grid)
+    count_grid = np.zeros_like(z_grid)
+    
+    # Bin the data points into the grid
+    for lon, lat, height in zip(lons, lats, heights):
+        lon_idx = np.searchsorted(lon_bins, lon) - 1
+        lat_idx = np.searchsorted(lat_bins, lat) - 1
+        if 0 <= lon_idx < z_grid.shape[1] and 0 <= lat_idx < z_grid.shape[0]:
+            height_sum[lat_idx, lon_idx] += height
+            count_grid[lat_idx, lon_idx] += 1
+    
+    # Calculate averages where we have data
+    mask = count_grid > 0
+    z_grid[mask] = height_sum[mask] / count_grid[mask]
+    # Leave NaN where we have no data (this will be ignored in contouring)
 
     # 4. Define contour levels and create contours
     # levels = [0, 0.2, 0.8, 2.0, 4.0, 6.0]
@@ -124,6 +173,90 @@ def calculate_contours3(csv_path, geojson_path, resolution=(30, 15)):
     print(f"Contours saved to {geojson_path}")
     
     plt.close()
+
+
+def calculate_contours3(csv_path, geojson_path, resolution=(30, 15)):
+    """
+    Calculate contours with reduced resolution and fewer levels.
+    Args:
+        csv_path: Path to the input CSV containing columns:
+                  longitude, latitude, wave_height.
+        geojson_path: Path to the output GeoJSON file with contour polygons.
+        resolution: Tuple (# of longitude bins, # of latitude bins).
+    """
+    start = time.time()
+    # 1. Read CSV data
+    lons, lats, heights = [], [], []
+    with open(csv_path, mode='r') as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            lons.append(float(row['longitude']))
+            lats.append(float(row['latitude']))
+            heights.append(float(row['wave_height']))
+    end = time.time()
+    print("part1 time: ", end - start)
+
+    start = time.time()
+    # 2. Prepare grid
+    min_lon, max_lon = min(lons), max(lons)
+    min_lat, max_lat = min(lats), max(lats)
+    lon_bins = np.linspace(min_lon, max_lon, resolution[0])
+    lat_bins = np.linspace(min_lat, max_lat, resolution[1])
+    lon_grid, lat_grid = np.meshgrid(lon_bins, lat_bins)
+    end = time.time()
+    print("part2 time: ", end - start)
+
+    start = time.time()
+    # 3. Interpolate data onto grid
+    z_grid = griddata(
+        (lons, lats), heights,
+        (lon_grid, lat_grid),
+        method='linear',
+        fill_value=np.nan
+    )
+    end = time.time()
+    print("part3 time: ", end - start)
+
+    # 4. Define contour levels and create contours
+    # levels = [0, 0.2, 0.8, 2.0, 4.0, 6.0]
+    start = time.time()
+    levels = [0, 0.5, 1.0, 2.0, 4.0, 6.0, 8.0, 10.0]
+
+    contour_set = plt.contour(lon_grid, lat_grid, z_grid, levels=levels)
+    end = time.time()
+    print("part4 time: ", end - start)
+
+    # 5. Extract polygons and build GeoJSON features
+    start = time.time()
+    features = []
+    # contour_set.allsegs is a list of segment lists for each contour level
+    for level_index, level_value in enumerate(contour_set.levels):
+        # Each entry in contour_set.allsegs[level_index] is a list of Nx2 arrays
+        for seg_coords in contour_set.allsegs[level_index]:
+            if len(seg_coords) < 3:
+                continue  # skip invalid polygons
+            poly = Polygon(seg_coords)
+            if not poly.is_valid:
+                poly = poly.buffer(0)  # attempt to fix invalid geometry
+            if not poly.is_empty:
+                feature = geojson.Feature(
+                    geometry=poly.__geo_interface__,
+                    properties={"contour_level": float(level_value)}
+                )
+                features.append(feature)
+    end = time.time()
+    print("part5 time: ", end - start)
+
+    # 6. Write out as GeoJSON
+    start = time.time()
+    feature_collection = geojson.FeatureCollection(features)
+    with open(geojson_path, 'w') as f:
+        geojson.dump(feature_collection, f)
+    print(f"Contours saved to {geojson_path}")
+    
+    plt.close()
+    end = time.time()
+    print("part6 time: ", end - start)
 
 
 def calculate_contours2(csv_path, geojson_path, resolution=(90, 45), num_levels=5):
@@ -260,14 +393,18 @@ for i in range(0, 24):
 
         with open(file_path, "wb") as file:
             file.write(response.content)
-        print(f"File {file_index} downloaded successfully")
+        print(f"File {file_index} downloaded and saved")
+    else: 
+        print(f"File {file_index} exists")
+    # if not os.path.exists(csv_path):
+    
+    data = extract_from_grib2_to_np(file_path)
+    calculate_contours4(data, geojson_path, resolution=(90, 45))
 
-    if not os.path.exists(csv_path):
-        data = extract_from_grib2(file_path)
-        save_to_csv(data, csv_path)
+    # save_to_csv(data, csv_path)
 
     # Use reduced resolution and fewer levels for contours
     # calculate_contours3(csv_path, geojson_path, resolution=(90, 45), num_levels=5)
-    calculate_contours3(csv_path, geojson_path, resolution=(90, 45))
-    # calculate_contours4(csv_path, geojson_path, shp_file_path, resolution=(90, 45))
+    # calculate_contours3(csv_path, geojson_path, resolution=(90, 45))
+
 
