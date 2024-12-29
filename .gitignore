@@ -3,3 +3,4 @@
 *.geojson
 *.grib2
 *.csv
+*.log

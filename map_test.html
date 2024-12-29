@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>MapLibre Contour Viewer with Slider</title>
+  <link
+    href="https://cdn.jsdelivr.net/npm/maplibre-gl@2.4.0/dist/maplibre-gl.css"
+    rel="stylesheet"
+  />
+  <style>
+    body {
+      margin: 0; padding: 0;
+    }
+    #map {
+      position: absolute;
+      top: 0; left: 0;
+      width: 80%; height: 100%;
+    }
+    #slider-container {
+      position: absolute;
+      top: 10px; right: 10px;
+      background: rgba(255, 255, 255, 0.9);
+      padding: 10px;
+      border-radius: 5px;
+      font-family: sans-serif;
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div id="slider-container">
+    <label for="timeSlider">Time Step: <span id="timeValue">0</span></label><br />
+    <input
+      id="timeSlider"
+      type="range"
+      min="1"
+      max="96"
+      step="1"
+      value="0"
+    />
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/maplibre-gl@2.4.0/dist/maplibre-gl.js"></script>
+  <script>
+    // Initialize map
+    const map = new maplibregl.Map({
+      container: 'map',
+      style: 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json',
+      center: [0, 0],
+      zoom: 2
+    });
+
+    // Once the map loads, add the initial source & layer
+    map.on('load', () => {
+      map.addSource('contours', {
+        type: 'geojson',
+        data: 'files/contours_000.geojson'
+      });
+
+      map.addLayer({
+        id: 'contour-fills',
+        type: 'fill',
+        source: 'contours',
+        paint: {
+          'fill-color': [
+            'case',
+            ['==', ['get', 'contour_level'], 0],    '#ADD8E6',
+            ['==', ['get', 'contour_level'], 0.5],  '#0000FF',
+            ['==', ['get', 'contour_level'], 1.0],  '#800080',
+            ['==', ['get', 'contour_level'], 2.0],  '#4575B4',  // Steel Blue
+            ['==', ['get', 'contour_level'], 4.0],  '#74ADD1',  // Light Blue
+            ['==', ['get', 'contour_level'], 6.0],  '#F46D43',  // Orange
+            ['==', ['get', 'contour_level'], 8.0],  '#D73027',  // Red
+            ['==', ['get', 'contour_level'], 10.0], '#A50026',  // Dark Red
+            '#ADD8E6'  // default color
+          ],
+          'fill-opacity': 0.8
+        }
+      });
+
+      // Add navigation controls
+      map.addControl(new maplibregl.NavigationControl());
+    });
+
+    // Slider logic
+    const timeSlider = document.getElementById('timeSlider');
+    const timeValue = document.getElementById('timeValue');
+
+    timeSlider.addEventListener('input', (event) => {
+      // Current slider value (1 through 11)
+      const val = parseInt(event.target.value);
+
+      // Update label
+      timeValue.textContent = val;
+
+      // Format into 3 digits: e.g., 1 -> 001, 9 -> 009, 10 -> 010
+      const padded = String(val).padStart(3, '0');
+
+      // Update the contours source with the new file
+      map.getSource('contours').setData(`files/contours_${padded}.geojson`);
+    });
+  </script>
+</body>
+</html>
+
+
