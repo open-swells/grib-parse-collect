@@ -12,7 +12,7 @@ if [ $? -eq 0 ]; then
 
     # Copy files to the remote server
     echo "Copying files from $SOURCE_PATH to $DEST_PATH"
-    scp "$SOURCE_PATH"/* "$DEST_PATH"
+    scp "$SOURCE_PATH"/*.geojson "$DEST_PATH"
 
     if [ $? -eq 0 ]; then
         echo "Files copied successfully."
