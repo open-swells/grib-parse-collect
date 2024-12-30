@@ -7,7 +7,6 @@ from scipy.ndimage import gaussian_filter
 import matplotlib.pyplot as plt
 from geojson import Feature, FeatureCollection, dumps
 from shapely.geometry import Point, Polygon, shape, LineString
-import shapefile
 from shapely.ops import unary_union
 from scipy.interpolate import griddata
 import geojson
