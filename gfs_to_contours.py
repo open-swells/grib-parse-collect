@@ -187,7 +187,35 @@ date_str, hour = find_latest_gfs_time()
 logger.info(f"Found latest GFS wave data for date {date_str} hour {hour}Z")
 
 # Process each forecast hour
-for i in range(0, 240):
+for i in range(0, 121):
+    file_index = f"{i:03}"  # Format index with leading zeros
+    file_path = f"files/gfswave.t{hour}z.global.0p16.f{file_index}.grib2"
+    geojson_path = f"files/contours_{file_index}.geojson"
+
+    if not os.path.exists(file_path):
+        url = f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/gfs.{date_str}/{hour}/wave/gridded/gfswave.t{hour}z.global.0p16.f{file_index}.grib2"
+        try:
+            response = requests.get(url)
+            response.raise_for_status()
+            with open(file_path, "wb") as file:
+                file.write(response.content)
+            logger.info(f"File {file_index} downloaded and saved")
+        except requests.RequestException as e:
+            logger.error(f"Error downloading file {file_index}: {e}")
+            continue
+    else: 
+        logger.info(f"File {file_index} exists")
+
+    try:
+        data = extract_from_grib2_to_np(file_path)
+        calculate_contours4(data, geojson_path, resolution=(90, 45))
+    except Exception as e:
+        logger.error(f"Error processing file {file_index}: {e}")
+        continue
+
+# After 5 days (120 hours), forecasts are in increments of 3
+# get values from 123 up to 384
+for i in range(123, 387):
     file_index = f"{i:03}"  # Format index with leading zeros
     file_path = f"files/gfswave.t{hour}z.global.0p16.f{file_index}.grib2"
     geojson_path = f"files/contours_{file_index}.geojson"

@@ -2,6 +2,11 @@
 
 # Path to the Python script
 PYTHON_SCRIPT="${PYTHON_SCRIPT:-/home/evan/grib-parse-collect/gfs_to_contours.py}"
+FILES_DIR="/home/evan/grib-parse-collect/files"
+
+# Clean up files directory
+echo "Cleaning files directory: $FILES_DIR"
+rm -f "$FILES_DIR"/*
 
 # Execute the Python script
 echo "Running Python script: $PYTHON_SCRIPT"
