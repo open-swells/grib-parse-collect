@@ -1,8 +1,13 @@
 #!/bin/bash
 
-# Path to the Python script
-PYTHON_SCRIPT="${PYTHON_SCRIPT:-/home/evan/grib-parse-collect/gfs_to_contours.py}"
-FILES_DIR="/home/evan/grib-parse-collect/files"
+# Load environment variables from config file
+if [ -f ".env" ]; then
+    source .env
+fi
+
+# Path to the Python script with defaults
+PYTHON_SCRIPT="${PYTHON_SCRIPT:-./gfs_to_contours.py}"
+FILES_DIR="${FILES_DIR:-./files}"
 
 # Clean up files directory
 echo "Cleaning files directory: $FILES_DIR"

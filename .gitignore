@@ -4,3 +4,4 @@
 *.grib2
 *.csv
 *.log
+.env
