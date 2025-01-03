@@ -15,8 +15,14 @@ from datetime import datetime, timedelta
 import logging
 import logging.handlers
 
-# Setup logging
-log_directory = "logs"
+if 'FILES_DIR' not in os.environ:
+    raise EnvironmentError("FILES_DIR environment variable is not set")
+
+if 'LOG_DIR' not in os.environ:
+    raise EnvironmentError("LOG_DIR environment variable is not set")
+
+# Setup logging using environment variable
+log_directory = os.environ['LOG_DIR']
 if not os.path.exists(log_directory):
     os.makedirs(log_directory)
 
@@ -189,8 +195,8 @@ logger.info(f"Found latest GFS wave data for date {date_str} hour {hour}Z")
 # Process each forecast hour
 for i in range(0, 121):
     file_index = f"{i:03}"  # Format index with leading zeros
-    file_path = f"files/gfswave.t{hour}z.global.0p16.f{file_index}.grib2"
-    geojson_path = f"files/contours_{file_index}.geojson"
+    file_path = os.path.join(os.environ['FILES_DIR'], f"gfswave.t{hour}z.global.0p16.f{file_index}.grib2")
+    geojson_path = os.path.join(os.environ['FILES_DIR'], f"contours_{file_index}.geojson")
 
     if not os.path.exists(file_path):
         url = f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/gfs.{date_str}/{hour}/wave/gridded/gfswave.t{hour}z.global.0p16.f{file_index}.grib2"
@@ -217,8 +223,8 @@ for i in range(0, 121):
 # get values from 123 up to 384
 for i in range(123, 387):
     file_index = f"{i:03}"  # Format index with leading zeros
-    file_path = f"files/gfswave.t{hour}z.global.0p16.f{file_index}.grib2"
-    geojson_path = f"files/contours_{file_index}.geojson"
+    file_path = os.path.join(os.environ['FILES_DIR'], f"gfswave.t{hour}z.global.0p16.f{file_index}.grib2")
+    geojson_path = os.path.join(os.environ['FILES_DIR'], f"contours_{file_index}.geojson")
 
     if not os.path.exists(file_path):
         url = f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/gfs.{date_str}/{hour}/wave/gridded/gfswave.t{hour}z.global.0p16.f{file_index}.grib2"
