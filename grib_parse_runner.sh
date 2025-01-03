@@ -1,8 +1,12 @@
 #!/bin/bash
 
 # Load environment variables from config file
-if [ -f ".env" ]; then
-    source .env
+# Get the directory where the script is located
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
+# Source the .env file using absolute path
+if [ -f "$SCRIPT_DIR/.env" ]; then
+    source "$SCRIPT_DIR/.env"
 fi
 
 # Path to the Python script with defaults

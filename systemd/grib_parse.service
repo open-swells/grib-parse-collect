@@ -4,8 +4,7 @@ After=network.target
 
 [Service]
 ExecStart=/home/evan/pyenv/bin/python3 /home/evan/grib-parse-collect/grib_parse_runner.sh
-Restart=always
-RestartSec=10
+RestartSec=100
 StandardOutput=journal
 StandardError=journal
 
