@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # Load environment variables from config file
-# Get the directory where the script is located
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+# Define absolute paths
+SCRIPT_DIR="/home/evan/grib-parse-collect"
 
-# Source the .env file using absolute path
+# Source the .env file
 if [ -f "$SCRIPT_DIR/.env" ]; then
     source "$SCRIPT_DIR/.env"
 fi
