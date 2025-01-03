@@ -13,12 +13,15 @@ else
 fi
 
 # Verify required environment variables
-for var in PYTHON_INTERPRETER PYTHON_SCRIPT FILES_DIR SOURCE_PATH DEST_PATH; do
+for var in PYTHON_INTERPRETER PYTHON_SCRIPT FILES_DIR SOURCE_PATH DEST_PATH LOG_DIR FILES_DIR; do
     if [ -z "${!var}" ]; then
         echo "Error: $var is not set in .env file"
         exit 1
     fi
 done
+
+export FILES_DIR
+export LOG_DIR
 
 # Clean up files directory
 echo "Cleaning files directory: $FILES_DIR"
