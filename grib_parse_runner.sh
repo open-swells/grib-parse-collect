@@ -13,7 +13,7 @@ else
 fi
 
 # Verify required environment variables
-for var in PYTHON_INTERPRETER PYTHON_SCRIPT FILES_DIR SOURCE_PATH DEST_PATH LOG_DIR FILES_DIR; do
+for var in PYTHON_INTERPRETER PYTHON_SCRIPT FILES_DIR SOURCE_PATH DEST_PATH LOG_DIR FILES_DIR SSH_KEY_PATH; do
     if [ -z "${!var}" ]; then
         echo "Error: $var is not set in .env file"
         exit 1
@@ -36,7 +36,7 @@ if [ $? -eq 0 ]; then
 
     # Copy files to the remote server
     echo "Copying files from $SOURCE_PATH to $DEST_PATH"
-    scp "$SOURCE_PATH"/*.geojson "$DEST_PATH"
+    scp -i "$SSH_KEY_PATH" "$SOURCE_PATH"/*.geojson "$DEST_PATH"
 
     if [ $? -eq 0 ]; then
         echo "Files copied successfully."
