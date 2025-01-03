@@ -3,7 +3,7 @@ Description=Run Python Script Every Six Hours
 After=network.target
 
 [Service]
-ExecStart=/home/evan/pyenv/bin/python3 /home/evan/grib-parse-collect/grib_parse_runner.sh
+ExecStart=/usr/bin/bash /home/evan/grib-parse-collect/grib_parse_runner.sh
 RestartSec=100
 StandardOutput=journal
 StandardError=journal
