@@ -2,24 +2,31 @@
 
 # Load environment variables from config file
 # Define absolute paths
-SCRIPT_DIR="/home/evan/grib-parse-collect"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Source the .env file
 if [ -f "$SCRIPT_DIR/.env" ]; then
     source "$SCRIPT_DIR/.env"
+else
+    echo "Error: .env file not found at $SCRIPT_DIR/.env"
+    exit 1
 fi
 
-# Path to the Python script with defaults
-PYTHON_SCRIPT="${PYTHON_SCRIPT:-./gfs_to_contours.py}"
-FILES_DIR="${FILES_DIR:-./files}"
+# Verify required environment variables
+for var in PYTHON_INTERPRETER PYTHON_SCRIPT FILES_DIR SOURCE_PATH DEST_PATH; do
+    if [ -z "${!var}" ]; then
+        echo "Error: $var is not set in .env file"
+        exit 1
+    fi
+done
 
 # Clean up files directory
 echo "Cleaning files directory: $FILES_DIR"
 rm -f "$FILES_DIR"/*
 
 # Execute the Python script
-echo "Running Python script: $PYTHON_SCRIPT"
-~/pyenv/bin/python3 "$PYTHON_SCRIPT"
+echo "Running Python script: $PYTHON_SCRIPT with interpreter: $PYTHON_INTERPRETER"
+"$PYTHON_INTERPRETER" "$PYTHON_SCRIPT"
 
 if [ $? -eq 0 ]; then
     echo "Python script executed successfully."
