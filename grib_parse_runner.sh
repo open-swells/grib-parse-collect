@@ -37,6 +37,7 @@ if [ $? -eq 0 ]; then
     # Copy files to the remote server
     echo "Copying files from $SOURCE_PATH to $DEST_PATH"
     scp -i "$SSH_KEY_PATH" "$SOURCE_PATH"/*.geojson "$DEST_PATH"
+    echo "Copying metadata from $SOURCE_PATH to $DEST_PATH"
     scp -i "$SSH_KEY_PATH" "$SOURCE_PATH"/*.json "$DEST_PATH"
 
     if [ $? -eq 0 ]; then
