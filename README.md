@@ -12,3 +12,14 @@ sudo systemctl daemon-reload
 sudo systemctl enable my_python_script.timer
 sudo systemctl start my_python_script.timer
 ```
+
+**necessary .env: **
+```
+SOURCE_PATH=...../grib-parse-collect/files
+DEST_PATH=<server>/open-swells-app/static
+PYTHON_SCRIPT=....../grib-parse-collect/gfs_to_contours.py
+PYTHON_INTERPRETER=...../bin/python3
+FILES_DIR=....../grib-parse-collect/files
+LOG_DIR=...../grib-parse-collect/logs
+SSH_KEY_PATH=/etc/ssh/ssh_host_ed25519_key
+```
