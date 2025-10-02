@@ -1,262 +1,438 @@
 import os
+import json
+import logging
+import logging.handlers
+from datetime import datetime, timedelta
+import datetime as dt
+
 import numpy as np
 import pygrib
 import requests
-import csv
-from scipy.ndimage import gaussian_filter
-import matplotlib.pyplot as plt
-from geojson import Feature, FeatureCollection, dumps
-from shapely.geometry import Point, Polygon, shape, LineString
-from shapely.ops import unary_union
-from scipy.interpolate import griddata
 import geojson
-import datetime as dt
-from datetime import datetime, timedelta
-import logging
-import logging.handlers
-import json
 
-if 'FILES_DIR' not in os.environ:
-    raise EnvironmentError("FILES_DIR environment variable is not set")
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.path import Path
 
-if 'LOG_DIR' not in os.environ:
-    raise EnvironmentError("LOG_DIR environment variable is not set")
+from geojson import Feature, FeatureCollection
+from shapely.geometry import Polygon
+from scipy.ndimage import gaussian_filter
 
-# Setup logging using environment variable
-log_directory = os.environ['LOG_DIR']
-if not os.path.exists(log_directory):
-    os.makedirs(log_directory)
-
-# Create logger
-logger = logging.getLogger('GFSWaveContours')
+logger = logging.getLogger("GFSWaveContours")
 logger.setLevel(logging.INFO)
 
-# Create handlers
-log_file = os.path.join(log_directory, 'gfs_wave_contours.log')
-file_handler = logging.handlers.RotatingFileHandler(
-    log_file, maxBytes=10485760, backupCount=5)  # 10MB per file, keep 5 backups
-console_handler = logging.StreamHandler()
-
-# Create formatters and add it to handlers
-log_format = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-file_handler.setFormatter(log_format)
-console_handler.setFormatter(log_format)
-
-# Add handlers to the logger
-logger.addHandler(file_handler)
-logger.addHandler(console_handler)
+_GRID_CACHE: dict[tuple, tuple[np.ndarray, np.ndarray]] = {}
 
 
-def extract_from_grib2_to_np(filepath):
+def setup_logging(log_directory: str) -> None:
+    if logger.handlers:
+        return
+    os.makedirs(log_directory, exist_ok=True)
+    log_file = os.path.join(log_directory, "gfs_wave_contours.log")
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_file, maxBytes=10_485_760, backupCount=5
+    )
+    console_handler = logging.StreamHandler()
+    log_format = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+    file_handler.setFormatter(log_format)
+    console_handler.setFormatter(log_format)
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    logger.propagate = False
+
+
+def _grid_cache_key(msg) -> tuple:
+    keys = []
+    for attr in (
+        "gridType",
+        "Ni",
+        "Nj",
+        "latitudeOfFirstGridPointInDegrees",
+        "longitudeOfFirstGridPointInDegrees",
+        "latitudeOfLastGridPointInDegrees",
+        "longitudeOfLastGridPointInDegrees",
+    ):
+        try:
+            value = msg[attr]
+        except (KeyError, AttributeError, TypeError):
+            value = getattr(msg, attr, None)
+        if isinstance(value, (int, float)):
+            keys.append(float(value))
+        else:
+            keys.append(value)
+    return tuple(keys)
+
+
+def _get_lat_lon_grid(msg) -> tuple[np.ndarray, np.ndarray]:
+    key = _grid_cache_key(msg)
+    cached = _GRID_CACHE.get(key)
+    if cached is not None:
+        return cached
+    lats, lons = msg.latlons()
+    grid = (np.array(lons, dtype=np.float32), np.array(lats, dtype=np.float32))
+    _GRID_CACHE[key] = grid
+    return grid
+
+
+def _gaussian_filter_nan(array: np.ndarray, sigma: float) -> np.ndarray:
+    if not sigma or sigma <= 0:
+        return array
+    if np.isnan(array).all():
+        return array
+    nan_mask = np.isnan(array)
+    filled = np.where(nan_mask, 0.0, array)
+    filtered = gaussian_filter(filled, sigma=sigma, mode="nearest")
+    weights = gaussian_filter((~nan_mask).astype(np.float32), sigma=sigma, mode="nearest")
+    with np.errstate(invalid="ignore", divide="ignore"):
+        filtered = np.divide(
+            filtered,
+            weights,
+            out=np.full_like(filtered, np.nan),
+            where=weights > 0,
+        )
+    filtered[np.logical_and(nan_mask, weights == 0)] = np.nan
+    return filtered
+
+
+def _derive_levels(values: np.ndarray, base_step: float = 0.5, max_levels: int = 60) -> np.ndarray:
+    valid = values[np.isfinite(values)]
+    if valid.size == 0:
+        raise ValueError("No valid data available for contouring.")
+    vmax = float(valid.max())
+    if vmax <= 0:
+        return np.array([0.0, base_step], dtype=float)
+    levels = np.arange(0.0, vmax + base_step, base_step, dtype=float)
+    if levels.size > max_levels:
+        levels = np.linspace(0.0, vmax, max_levels, dtype=float)
+    if levels[-1] < vmax:
+        levels = np.append(levels, vmax)
+    if levels.size < 2:
+        levels = np.array([0.0, vmax], dtype=float)
+    return levels
+
+
+def extract_from_grib2_to_np(filepath: str) -> dict:
     grbs = pygrib.open(filepath)
-    height_param_name = 'Significant height of total swell'
-    period_param_name = 'Mean period of total swell'
-    direction_param_name = 'Direction of swell waves'
+    try:
+        height_param_name = "Significant height of total swell"
+        period_param_name = "Mean period of total swell"
+        direction_param_name = "Direction of swell waves"
 
-    height_messages = grbs.select(name=height_param_name)
-    period_messages = grbs.select(name=period_param_name)
-    direction_messages = grbs.select(name=direction_param_name)
+        try:
+            height_msg = grbs.select(name=height_param_name)[0]
+            period_msg = grbs.select(name=period_param_name)[0]
+            direction_msg = grbs.select(name=direction_param_name)[0]
+        except (IndexError, ValueError) as exc:
+            raise RuntimeError(f"Missing required fields in {filepath}") from exc
 
-    # We'll only process the first message (timestamp) for now
-    height_msg = height_messages[0]
-    period_msg = period_messages[0]
-    direction_msg = direction_messages[0]
+        if not (
+            height_msg.validDate
+            == period_msg.validDate
+            == direction_msg.validDate
+        ):
+            raise ValueError("Mismatched valid times between GRIB fields")
 
-    if height_msg.validDate == period_msg.validDate == direction_msg.validDate:
-        date = height_msg.validDate
-        lats, lons = height_msg.latlons()
-        height_data = height_msg.values
-        period_data = period_msg.values
-        direction_data = direction_msg.values
+        lon_grid, lat_grid = _get_lat_lon_grid(height_msg)
+        height_values = np.ma.filled(height_msg.values, np.nan).astype(np.float32)
+        period_values = np.ma.filled(period_msg.values, np.nan).astype(np.float32)
+        direction_values = np.ma.filled(direction_msg.values, np.nan).astype(np.float32)
+        mask = np.ma.getmaskarray(height_msg.values)
 
-        # Create mask for valid (non-masked) data points
-        valid_mask = np.logical_not(np.ma.getmask(height_data))
-        
-        # Get the number of valid points
-        n_valid = np.sum(valid_mask)
-        
-        # Create output arrays
-        out_lats = lats[valid_mask]
-        out_lons = lons[valid_mask]
-        out_heights = height_data[valid_mask]
-        out_periods = period_data[valid_mask]
-        out_directions = direction_data[valid_mask]
-        
-        # Stack all arrays horizontally
-        return np.column_stack((out_lons, out_lats, out_heights, out_periods, out_directions))
-    
-    return np.array([])  # Return empty array if no valid data
-
+        return {
+            "lon": lon_grid,
+            "lat": lat_grid,
+            "height": height_values,
+            "height_mask": mask,
+            "period": period_values,
+            "direction": direction_values,
+            "valid_date": height_msg.validDate,
+        }
+    finally:
+        grbs.close()
 
 
-def calculate_contours4(data, geojson_path, resolution=(30, 15)):
-    """
-    Calculate contours with reduced resolution and fewer levels.
-    Args:
-        csv_path: Path to the input CSV containing columns:
-                  longitude, latitude, wave_height.
-        geojson_path: Path to the output GeoJSON file with contour polygons.
-        resolution: Tuple (# of longitude bins, # of latitude bins).
-    """
-    # 1. read data
-    lons, lats, heights = [], [], []
-    lons = data[:, 0]
-    lats = data[:, 1]
-    heights = data[:, 2]
+def calculate_contours4(
+    data: dict,
+    geojson_path: str,
+    *,
+    levels: np.ndarray | None = None,
+    smoothing_sigma: float = 1.0,
+    simplify_tolerance: float | None = None,
+    min_area: float | None = None,
+    stride: int = 2,
+    extra_properties: dict | None = None,
+) -> np.ndarray:
+    lon_grid = data["lon"]
+    lat_grid = data["lat"]
+    height_values = data["height"].astype(np.float32, copy=False)
+    mask = data.get("height_mask")
 
+    grid = np.where(mask, np.nan, height_values) if mask is not None else height_values
+    grid = _gaussian_filter_nan(grid, smoothing_sigma)
 
-    # 2. Prepare grid
-    min_lon, max_lon = min(lons), max(lons)
-    min_lat, max_lat = min(lats), max(lats)
-    lon_bins = np.linspace(min_lon, max_lon, resolution[0])
-    lat_bins = np.linspace(min_lat, max_lat, resolution[1])
-    lon_grid, lat_grid = np.meshgrid(lon_bins, lat_bins)
+    if stride and stride > 1:
+        grid = grid[::stride, ::stride]
+        lon_grid = lon_grid[::stride, ::stride]
+        lat_grid = lat_grid[::stride, ::stride]
 
-    # 3. Bin data directly into grid (no interpolation)
-    z_grid = np.full(lon_grid.shape, np.nan)  # Initialize with NaN
-    height_sum = np.zeros_like(z_grid)
-    count_grid = np.zeros_like(z_grid)
-    
-    # Bin the data points into the grid
-    for lon, lat, height in zip(lons, lats, heights):
-        lon_idx = np.searchsorted(lon_bins, lon) - 1
-        lat_idx = np.searchsorted(lat_bins, lat) - 1
-        if 0 <= lon_idx < z_grid.shape[1] and 0 <= lat_idx < z_grid.shape[0]:
-            height_sum[lat_idx, lon_idx] += height
-            count_grid[lat_idx, lon_idx] += 1
-    
-    # Calculate averages where we have data
-    mask = count_grid > 0
-    z_grid[mask] = height_sum[mask] / count_grid[mask]
-    # Leave NaN where we have no data (this will be ignored in contouring)
+    if levels is None:
+        levels = _derive_levels(grid)
 
-    # 4. Define contour levels and create contours
-    # levels = [0, 0.2, 0.8, 2.0, 4.0, 6.0]
-    levels = [0, 0.5, 1.0, 2.0, 4.0, 6.0, 8.0, 10.0]
+    masked_data = np.ma.masked_invalid(grid)
+    fig, ax = plt.subplots(figsize=(4, 2.5), dpi=100)
+    try:
+        contour = ax.contourf(
+            lon_grid,
+            lat_grid,
+            masked_data,
+            levels=levels,
+            antialiased=True,
+        )
+    finally:
+        plt.close(fig)
 
-    contour_set = plt.contour(lon_grid, lat_grid, z_grid, levels=levels)
+    if min_area is None:
+        lon_spacing = np.nanmedian(np.abs(np.diff(lon_grid, axis=1)))
+        lat_spacing = np.nanmedian(np.abs(np.diff(lat_grid, axis=0)))
+        if np.isfinite(lon_spacing) and np.isfinite(lat_spacing):
+            min_area = float((lon_spacing * lat_spacing) / 8.0)
+        else:
+            min_area = 0.0
 
-    # 5. Extract polygons and build GeoJSON features
-    features = []
-    # contour_set.allsegs is a list of segment lists for each contour level
-    for level_index, level_value in enumerate(contour_set.levels):
-        # Each entry in contour_set.allsegs[level_index] is a list of Nx2 arrays
-        for seg_coords in contour_set.allsegs[level_index]:
-            if len(seg_coords) < 3:
-                continue  # skip invalid polygons
-            poly = Polygon(seg_coords)
-            if not poly.is_valid:
-                poly = poly.buffer(0)  # attempt to fix invalid geometry
-            if not poly.is_empty:
-                feature = geojson.Feature(
-                    geometry=poly.__geo_interface__,
-                    properties={"contour_level": float(level_value)}
-                )
-                features.append(feature)
+    features: list[Feature] = []
+    extra_properties = extra_properties or {}
+    valid_time = data.get("valid_date")
+    base_properties = dict(extra_properties)
+    if valid_time:
+        base_properties.setdefault("valid_time", valid_time.isoformat())
 
-    # 6. Write out as GeoJSON
-    feature_collection = geojson.FeatureCollection(features)
-    with open(geojson_path, 'w') as f:
-        geojson.dump(feature_collection, f)
-    logger.info(f"Contours saved to {geojson_path}")
-    
-    plt.close()
+    def _iter_paths():
+        collections = getattr(contour, "collections", None)
+        if collections is not None:
+            for collection, lower, upper in zip(
+                collections, contour.levels[:-1], contour.levels[1:]
+            ):
+                for path in collection.get_paths():
+                    yield lower, upper, path.to_polygons()
+            return
 
-def find_latest_gfs_time():
-    """Find the latest available GFS wave data time."""
-    base_url = "https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/"
-    hours = ['18', '12', '06', '00']
-    
-    # Start with tomorrow's date
-    current_date = dt.datetime.now(dt.UTC) + timedelta(days=1)
-    
-    # Try dates going backwards for 2 days
-    for days_back in range(3):
-        date_str = current_date.strftime('%Y%m%d')
-        
-        # Try each hour for this date
-        for hour in hours:
-            test_url = f"{base_url}gfs.{date_str}/{hour}/wave/gridded/"
-            try:
-                response = requests.head(test_url)
-                if response.status_code == 200:
-                    return date_str, hour
-            except requests.RequestException:
+        allsegs = getattr(contour, "allsegs", None)
+        if allsegs is None:
+            raise RuntimeError(
+                "Matplotlib contour output does not expose polygon collections or segments."
+            )
+        allkinds = getattr(contour, "allkinds", None)
+
+        for idx, (lower, upper) in enumerate(
+            zip(contour.levels[:-1], contour.levels[1:])
+        ):
+            segs = allsegs[idx]
+            if not segs:
                 continue
-        
-        # Move to previous day
-        current_date -= timedelta(days=1)
-    
-    raise Exception("Could not find valid GFS wave data in the last 2 days")
+            if allkinds is not None:
+                kind_list = allkinds[idx]
+            else:
+                kind_list = [None] * len(segs)
+            for seg_coords, kind in zip(segs, kind_list):
+                if seg_coords is None or len(seg_coords) < 3:
+                    continue
+                try:
+                    path = Path(seg_coords, kind) if kind is not None else Path(seg_coords)
+                    polygons = path.to_polygons()
+                except Exception:
+                    polygons = [seg_coords]
+                if not polygons:
+                    continue
+                yield lower, upper, polygons
 
-# Find the latest available GFS time
-date_str, hour = find_latest_gfs_time()
-logger.info(f"Found latest GFS wave data for date {date_str} hour {hour}Z")
-
-# Save metadata to JSON file
-metadata_path = os.path.join(os.environ['FILES_DIR'], 'metadata.json')
-metadata = {
-    'date': date_str,
-    'hour': hour,
-    'timestamp': datetime.now(dt.UTC).isoformat(),
-    'forecast_start': f"{date_str}_{hour}Z"
-}
-
-with open(metadata_path, 'w') as f:
-    json.dump(metadata, f, indent=2)
-logger.info(f"Saved metadata to {metadata_path}")
-
-# Process each forecast hour
-for i in range(0, 121):
-    file_index = f"{i:03}"  # Format index with leading zeros
-    file_path = os.path.join(os.environ['FILES_DIR'], f"gfswave.t{hour}z.global.0p16.f{file_index}.grib2")
-    geojson_path = os.path.join(os.environ['FILES_DIR'], f"contours_{file_index}.geojson")
-
-    if not os.path.exists(file_path):
-        url = f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/gfs.{date_str}/{hour}/wave/gridded/gfswave.t{hour}z.global.0p16.f{file_index}.grib2"
-        try:
-            response = requests.get(url)
-            response.raise_for_status()
-            with open(file_path, "wb") as file:
-                file.write(response.content)
-            logger.info(f"File {file_index} downloaded and saved")
-        except requests.RequestException as e:
-            logger.error(f"Error downloading file {file_index}: {e}")
+    for lower, upper, polygon_coords in _iter_paths():
+        exterior = polygon_coords[0]
+        if exterior.shape[0] < 3:
             continue
-    else: 
-        logger.info(f"File {file_index} exists")
+        holes = [hole for hole in polygon_coords[1:] if hole.shape[0] >= 3]
+        polygon = Polygon(exterior, holes)
+        if not polygon.is_valid:
+            polygon = polygon.buffer(0)
+        if polygon.is_empty:
+            continue
+        if min_area and polygon.area < min_area:
+            continue
+        if simplify_tolerance:
+            simplified = polygon.simplify(simplify_tolerance, preserve_topology=True)
+            if simplified.is_empty:
+                continue
+            polygon = simplified
+        properties = {
+            "contour_min": float(lower),
+            "contour_max": float(upper),
+            "contour_mean": float((lower + upper) / 2.0),
+        }
+        properties.update(base_properties)
+        features.append(
+            Feature(geometry=polygon.__geo_interface__, properties=properties)
+        )
+
+    if not features:
+        logger.warning("No contour polygons generated for %s", geojson_path)
+    feature_collection = FeatureCollection(features)
+    with open(geojson_path, "w") as f:
+        geojson.dump(feature_collection, f)
+    logger.info(
+        "Contours saved to %s (%d polygons)", geojson_path, len(features)
+    )
+    return levels
+
+
+def find_latest_gfs_time(session: requests.Session | None = None) -> tuple[str, str]:
+    hours = ["18", "12", "06", "00"]
+    base_url = "https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/"
+
+    own_session = False
+    if session is None:
+        session = requests.Session()
+        own_session = True
 
     try:
-        data = extract_from_grib2_to_np(file_path)
-        calculate_contours4(data, geojson_path, resolution=(90, 45))
-    except Exception as e:
-        logger.error(f"Error processing file {file_index}: {e}")
-        continue
+        current_date = dt.datetime.now(dt.UTC) + timedelta(days=1)
+        for _ in range(3):
+            date_str = current_date.strftime("%Y%m%d")
+            for hour in hours:
+                test_url = f"{base_url}gfs.{date_str}/{hour}/wave/gridded/"
+                try:
+                    response = session.head(test_url, timeout=10)
+                    if response.status_code == 200:
+                        return date_str, hour
+                except requests.RequestException as exc:
+                    logger.debug("HEAD request failed for %s: %s", test_url, exc)
+                    continue
+            current_date -= timedelta(days=1)
+    finally:
+        if own_session:
+            session.close()
 
-# After 5 days (120 hours), forecasts are in increments of 3
-# get values from 123 up to 384
-for i in range(123, 387, 3):
-    file_index = f"{i:03}"  # Format index with leading zeros
-    file_path = os.path.join(os.environ['FILES_DIR'], f"gfswave.t{hour}z.global.0p16.f{file_index}.grib2")
-    geojson_path = os.path.join(os.environ['FILES_DIR'], f"contours_{file_index}.geojson")
+    raise RuntimeError("Could not find valid GFS wave data in the last 2 days")
 
-    if not os.path.exists(file_path):
-        url = f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/gfs.{date_str}/{hour}/wave/gridded/gfswave.t{hour}z.global.0p16.f{file_index}.grib2"
-        try:
-            response = requests.get(url)
-            response.raise_for_status()
-            with open(file_path, "wb") as file:
-                file.write(response.content)
-            logger.info(f"File {file_index} downloaded and saved")
-        except requests.RequestException as e:
-            logger.error(f"Error downloading file {file_index}: {e}")
-            continue
-    else: 
-        logger.info(f"File {file_index} exists")
+
+def write_metadata(files_dir: str, date_str: str, hour: str) -> str:
+    metadata_path = os.path.join(files_dir, "metadata.json")
+    metadata = {
+        "date": date_str,
+        "hour": hour,
+        "timestamp": datetime.now(dt.UTC).isoformat(),
+        "forecast_start": f"{date_str}_{hour}Z",
+    }
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+    logger.info("Saved metadata to %s", metadata_path)
+    return metadata_path
+
+
+def process_forecast_hours(
+    hour_sequence,
+    date_str: str,
+    run_hour: str,
+    files_dir: str,
+    *,
+    stride: int = 2,
+    smoothing_sigma: float = 1.0,
+    simplify_tolerance: float | None = None,
+    session: requests.Session | None = None,
+) -> None:
+    base_url = (
+        "https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/"
+        f"gfs.{date_str}/{run_hour}/wave/gridded"
+    )
+
+    own_session = False
+    if session is None:
+        session = requests.Session()
+        own_session = True
 
     try:
-        data = extract_from_grib2_to_np(file_path)
-        calculate_contours4(data, geojson_path, resolution=(90, 45))
-    except Exception as e:
-        logger.error(f"Error processing file {file_index}: {e}")
-        continue
+        for forecast_hour in hour_sequence:
+            file_index = f"{int(forecast_hour):03}"
+            file_name = f"gfswave.t{run_hour}z.global.0p16.f{file_index}.grib2"
+            file_path = os.path.join(files_dir, file_name)
+            geojson_path = os.path.join(files_dir, f"contours_{file_index}.geojson")
+
+            if not os.path.exists(file_path):
+                url = f"{base_url}/{file_name}"
+                try:
+                    response = session.get(url, timeout=120)
+                    response.raise_for_status()
+                    with open(file_path, "wb") as file:
+                        file.write(response.content)
+                    logger.info("File %s downloaded and saved", file_index)
+                except requests.RequestException as exc:
+                    logger.error("Error downloading file %s: %s", file_index, exc)
+                    continue
+            else:
+                logger.info("File %s exists", file_index)
+
+            try:
+                data = extract_from_grib2_to_np(file_path)
+                calculate_contours4(
+                    data,
+                    geojson_path,
+                    stride=stride,
+                    smoothing_sigma=smoothing_sigma,
+                    simplify_tolerance=simplify_tolerance,
+                    extra_properties={"forecast_hour": int(forecast_hour)},
+                )
+            except Exception as exc:
+                logger.error(
+                    "Error processing file %s: %s", file_index, exc, exc_info=True
+                )
+    finally:
+        if own_session:
+            session.close()
+
+
+def main() -> None:
+    files_dir = os.environ.get("FILES_DIR")
+    if not files_dir:
+        raise EnvironmentError("FILES_DIR environment variable is not set")
+    log_dir = os.environ.get("LOG_DIR")
+    if not log_dir:
+        raise EnvironmentError("LOG_DIR environment variable is not set")
+
+    setup_logging(log_dir)
+
+    stride = max(int(os.environ.get("CONTOUR_STRIDE", "2") or 1), 1)
+    smoothing_sigma = float(os.environ.get("CONTOUR_SMOOTHING_SIGMA", "1.0") or 1.0)
+    simplify_env = os.environ.get("CONTOUR_SIMPLIFY_TOLERANCE")
+    simplify_tolerance = float(simplify_env) if simplify_env else None
+
+    with requests.Session() as session:
+        date_str, hour = find_latest_gfs_time(session=session)
+        logger.info(
+            "Found latest GFS wave data for date %s hour %sZ", date_str, hour
+        )
+        write_metadata(files_dir, date_str, hour)
+        process_forecast_hours(
+            range(0, 121),
+            date_str,
+            hour,
+            files_dir,
+            stride=stride,
+            smoothing_sigma=smoothing_sigma,
+            simplify_tolerance=simplify_tolerance,
+            session=session,
+        )
+        process_forecast_hours(
+            range(123, 387, 3),
+            date_str,
+            hour,
+            files_dir,
+            stride=stride,
+            smoothing_sigma=smoothing_sigma,
+            simplify_tolerance=simplify_tolerance,
+            session=session,
+        )
+
+
+if __name__ == "__main__":
+    main()
