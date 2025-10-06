@@ -1,53 +1,69 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Load environment variables from config file
-# Define absolute paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$SCRIPT_DIR"
 
-# Source the .env file
-if [ -f "$SCRIPT_DIR/.env" ]; then
-    source "$SCRIPT_DIR/.env"
-else
-    echo "Error: .env file not found at $SCRIPT_DIR/.env"
+ENV_FILE="${ENV_FILE:-"$PROJECT_ROOT/.env"}"
+if [ ! -f "$ENV_FILE" ]; then
+    echo "Error: env file not found at $ENV_FILE" >&2
     exit 1
 fi
 
-# Verify required environment variables
-for var in PYTHON_INTERPRETER PYTHON_SCRIPT FILES_DIR SOURCE_PATH DEST_PATH LOG_DIR FILES_DIR SSH_KEY_PATH; do
-    if [ -z "${!var}" ]; then
-        echo "Error: $var is not set in .env file"
+set -a
+source "$ENV_FILE"
+set +a
+
+PYTHON_SCRIPT="${PYTHON_SCRIPT:-"$PROJECT_ROOT/gfs_to_contours.py"}"
+FILES_DIR="${FILES_DIR:-"$PROJECT_ROOT/files"}"
+LOG_DIR="${LOG_DIR:-"$PROJECT_ROOT/logs"}"
+
+for var in PYTHON_SCRIPT FILES_DIR LOG_DIR; do
+    value="${!var:-}"
+    if [ -z "$value" ]; then
+        echo "Error: $var must be set in the environment." >&2
         exit 1
     fi
 done
 
-export FILES_DIR
-export LOG_DIR
+if [ ! -f "$PYTHON_SCRIPT" ]; then
+    alt_path="$PROJECT_ROOT/$PYTHON_SCRIPT"
+    if [ -f "$alt_path" ]; then
+        PYTHON_SCRIPT="$alt_path"
+    else
+        echo "Error: Python script not found at $PYTHON_SCRIPT" >&2
+        exit 1
+    fi
+fi
 
-# Clean up files directory
+mkdir -p "$FILES_DIR" "$LOG_DIR"
+
 echo "Cleaning files directory: $FILES_DIR"
 rm -f "$FILES_DIR"/*
 
-# Execute the Python script
-echo "Running Python script: $PYTHON_SCRIPT with interpreter: $PYTHON_INTERPRETER"
-"$PYTHON_INTERPRETER" "$PYTHON_SCRIPT"
+UV_CANDIDATES=(
+    "${UV_BIN:-}"
+    "$PROJECT_ROOT/uv"
+    "$PROJECT_ROOT/.venv/bin/uv"
+)
+FOUND_UV=""
+for candidate in "${UV_CANDIDATES[@]}"; do
+    if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+        FOUND_UV="$candidate"
+        break
+    fi
+done
 
-if [ $? -eq 0 ]; then
-    echo "Python script executed successfully."
-
-    # Copy files to the remote server
-    echo "Copying files from $SOURCE_PATH to $DEST_PATH"
-    scp -i "$SSH_KEY_PATH" "$SOURCE_PATH"/*.geojson "$DEST_PATH"
-    echo "Copying metadata from $SOURCE_PATH to $DEST_PATH"
-    scp -i "$SSH_KEY_PATH" "$SOURCE_PATH"/*.json "$DEST_PATH"
-
-    if [ $? -eq 0 ]; then
-        echo "Files copied successfully."
+if [ -z "$FOUND_UV" ]; then
+    if command -v uv >/dev/null 2>&1; then
+        FOUND_UV="$(command -v uv)"
     else
-        echo "Error: Failed to copy files."
+        echo "Error: unable to locate uv executable. Set UV_BIN or install uv." >&2
         exit 1
     fi
-else
-    echo "Error: Python script execution failed."
-    exit 1
 fi
 
+export FILES_DIR LOG_DIR
+
+echo "Running Python script via uv: $PYTHON_SCRIPT"
+"$FOUND_UV" run --project "$PROJECT_ROOT" python "$PYTHON_SCRIPT"
