@@ -413,7 +413,7 @@ def main() -> None:
         )
         write_metadata(files_dir, date_str, hour)
         process_forecast_hours(
-            range(0, 121),
+            range(0, 121, 3),
             date_str,
             hour,
             files_dir,
