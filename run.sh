@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+exec >>./logs/grib-run.log 2>&1
+echo "==== $(date -Is) START $$ ===="
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
