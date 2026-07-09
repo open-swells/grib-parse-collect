@@ -1,12 +1,14 @@
 [Unit]
-Description=Run Python Script Every Six Hours
-After=network.target
+Description=Fetch GFS wave data, generate contours, publish to web server
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-ExecStart=/usr/bin/bash /home/evan/grib-parse-collect/grib_parse_runner.sh
-RestartSec=100
+Type=oneshot
+User=evan
+WorkingDirectory=/home/evan/grib-parse-collect
+ExecStart=/usr/bin/bash /home/evan/grib-parse-collect/run.sh
+# A run downloads ~130 grib files and contours them; kill it if it wedges.
+TimeoutStartSec=3h
 StandardOutput=journal
 StandardError=journal
-
-[Install]
-WantedBy=multi-user.target

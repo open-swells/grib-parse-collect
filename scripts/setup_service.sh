@@ -1,28 +1,17 @@
 #!/bin/bash
+# Install/refresh the systemd service + timer. Run from the deployed
+# project directory (expected at /home/evan/grib-parse-collect).
+set -euo pipefail
 
-# Variables
-SERVICE_NAME="grib_parse"
-SERVICE_FILE="$SERVICE_NAME.service"
-TIMER_FILE="$SERVICE_NAME.timer"
-SCRIPT_PATH="grib-parse.py"
-SYSTEMD_PATH="/etc/systemd/system"
-DEST_PATH="/usr/local/bin" # Location on the server for the Python script
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-echo "Copying files to the server..."
-sudo cp "systemd/$SERVICE_FILE" "$SYSTEMD_PATH"
-sudo cp "systemd/$TIMER_FILE" "$SYSTEMD_PATH"
-sudo mkdir -p "$DEST_PATH"
-sudo cp "$SCRIPT_PATH" "$DEST_PATH"
+sudo cp "$PROJECT_ROOT/systemd/grib_parse.service" /etc/systemd/system/
+sudo cp "$PROJECT_ROOT/systemd/grib_parse.timer" /etc/systemd/system/
+sudo chmod 644 /etc/systemd/system/grib_parse.service /etc/systemd/system/grib_parse.timer
 
-echo "Setting permissions..."
-sudo chmod 644 "$SYSTEMD_PATH/$SERVICE_FILE"
-sudo chmod 644 "$SYSTEMD_PATH/$TIMER_FILE"
-sudo chmod +x "$DEST_PATH/$(basename $SCRIPT_PATH)"
-
-echo "Reloading systemd and enabling the timer..."
 sudo systemctl daemon-reload
-sudo systemctl enable "$TIMER_FILE"
-sudo systemctl start "$TIMER_FILE"
+sudo systemctl enable --now grib_parse.timer
 
-echo "Service and timer setup completed."
-
+echo "Timer status:"
+sudo systemctl list-timers grib_parse.timer --no-pager

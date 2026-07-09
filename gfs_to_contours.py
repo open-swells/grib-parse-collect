@@ -1,7 +1,9 @@
+import gzip
 import os
 import json
 import logging
 import logging.handlers
+import sys
 from datetime import datetime, timedelta
 import datetime as dt
 
@@ -17,6 +19,7 @@ from matplotlib.path import Path
 
 from geojson import Feature, FeatureCollection
 from shapely.geometry import Polygon
+from shapely.ops import transform as shapely_transform
 from scipy.ndimage import gaussian_filter
 
 logger = logging.getLogger("GFSWaveContours")
@@ -265,6 +268,10 @@ def calculate_contours4(
             if simplified.is_empty:
                 continue
             polygon = simplified
+        # ~11m precision; full float precision roughly doubles file size
+        polygon = shapely_transform(
+            lambda x, y, z=None: (np.round(x, 4), np.round(y, 4)), polygon
+        )
         properties = {
             "contour_min": float(lower),
             "contour_max": float(upper),
@@ -278,8 +285,12 @@ def calculate_contours4(
     if not features:
         logger.warning("No contour polygons generated for %s", geojson_path)
     feature_collection = FeatureCollection(features)
+    payload = geojson.dumps(feature_collection)
     with open(geojson_path, "w") as f:
-        geojson.dump(feature_collection, f)
+        f.write(payload)
+    # Precompressed sibling; the web app serves it when clients accept gzip.
+    with gzip.open(geojson_path + ".gz", "wt", encoding="utf-8", compresslevel=6) as f:
+        f.write(payload)
     logger.info(
         "Contours saved to %s (%d polygons)", geojson_path, len(features)
     )
@@ -300,7 +311,13 @@ def find_latest_gfs_time(session: requests.Session | None = None) -> tuple[str, 
         for _ in range(3):
             date_str = current_date.strftime("%Y%m%d")
             for hour in hours:
-                test_url = f"{base_url}gfs.{date_str}/{hour}/wave/gridded/"
+                # NOAA uploads forecast hours progressively; the run directory
+                # appears long before it is complete. Probe the last forecast
+                # hour we consume so we never process a half-uploaded run.
+                test_url = (
+                    f"{base_url}gfs.{date_str}/{hour}/wave/gridded/"
+                    f"gfswave.t{hour}z.global.0p16.f384.grib2"
+                )
                 try:
                     response = session.head(test_url, timeout=10)
                     if response.status_code == 200:
@@ -316,14 +333,24 @@ def find_latest_gfs_time(session: requests.Session | None = None) -> tuple[str, 
     raise RuntimeError("Could not find valid GFS wave data in the last 2 days")
 
 
-def write_metadata(files_dir: str, date_str: str, hour: str) -> str:
+def write_metadata(
+    files_dir: str,
+    date_str: str,
+    hour: str,
+    successes: int | None = None,
+    failures: int | None = None,
+) -> str:
     metadata_path = os.path.join(files_dir, "metadata.json")
-    metadata = {
+    metadata: dict[str, object] = {
         "date": date_str,
         "hour": hour,
         "timestamp": datetime.now(dt.UTC).isoformat(),
         "forecast_start": f"{date_str}_{hour}Z",
     }
+    if successes is not None:
+        metadata["hours_processed"] = successes
+    if failures is not None:
+        metadata["hours_failed"] = failures
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
     logger.info("Saved metadata to %s", metadata_path)
@@ -340,7 +367,7 @@ def process_forecast_hours(
     smoothing_sigma: float = 1.0,
     simplify_tolerance: float | None = None,
     session: requests.Session | None = None,
-) -> None:
+) -> tuple[int, int]:
     base_url = (
         "https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/"
         f"gfs.{date_str}/{run_hour}/wave/gridded"
@@ -351,6 +378,8 @@ def process_forecast_hours(
         session = requests.Session()
         own_session = True
 
+    successes = 0
+    failures = 0
     try:
         for forecast_hour in hour_sequence:
             file_index = f"{int(forecast_hour):03}"
@@ -360,15 +389,11 @@ def process_forecast_hours(
 
             if not os.path.exists(file_path):
                 url = f"{base_url}/{file_name}"
-                try:
-                    response = session.get(url, timeout=120)
-                    response.raise_for_status()
-                    with open(file_path, "wb") as file:
-                        file.write(response.content)
-                    logger.info("File %s downloaded and saved", file_index)
-                except requests.RequestException as exc:
-                    logger.error("Error downloading file %s: %s", file_index, exc)
+                if not _download_file(session, url, file_path):
+                    logger.error("Giving up on file %s", file_index)
+                    failures += 1
                     continue
+                logger.info("File %s downloaded and saved", file_index)
             else:
                 logger.info("File %s exists", file_index)
 
@@ -382,13 +407,37 @@ def process_forecast_hours(
                     simplify_tolerance=simplify_tolerance,
                     extra_properties={"forecast_hour": int(forecast_hour)},
                 )
+                successes += 1
             except Exception as exc:
+                failures += 1
                 logger.error(
                     "Error processing file %s: %s", file_index, exc, exc_info=True
                 )
     finally:
         if own_session:
             session.close()
+    return successes, failures
+
+
+def _download_file(
+    session: requests.Session, url: str, file_path: str, attempts: int = 3
+) -> bool:
+    for attempt in range(1, attempts + 1):
+        try:
+            response = session.get(url, timeout=120)
+            response.raise_for_status()
+            # Write then rename so an interrupted download never leaves a
+            # partial .grib2 that a later run would treat as complete.
+            tmp_path = file_path + ".part"
+            with open(tmp_path, "wb") as file:
+                file.write(response.content)
+            os.replace(tmp_path, file_path)
+            return True
+        except requests.RequestException as exc:
+            logger.warning(
+                "Download attempt %d/%d failed for %s: %s", attempt, attempts, url, exc
+            )
+    return False
 
 
 def main() -> None:
@@ -411,27 +460,36 @@ def main() -> None:
         logger.info(
             "Found latest GFS wave data for date %s hour %sZ", date_str, hour
         )
-        write_metadata(files_dir, date_str, hour)
-        process_forecast_hours(
-            range(0, 121, 3),
-            date_str,
-            hour,
-            files_dir,
-            stride=stride,
-            smoothing_sigma=smoothing_sigma,
-            simplify_tolerance=simplify_tolerance,
-            session=session,
-        )
-        process_forecast_hours(
-            range(123, 387, 3),
-            date_str,
-            hour,
-            files_dir,
-            stride=stride,
-            smoothing_sigma=smoothing_sigma,
-            simplify_tolerance=simplify_tolerance,
-            session=session,
-        )
+        successes = 0
+        failures = 0
+        for hour_sequence in (range(0, 121, 3), range(123, 387, 3)):
+            ok, failed = process_forecast_hours(
+                hour_sequence,
+                date_str,
+                hour,
+                files_dir,
+                stride=stride,
+                smoothing_sigma=smoothing_sigma,
+                simplify_tolerance=simplify_tolerance,
+                session=session,
+            )
+            successes += ok
+            failures += failed
+
+        # Metadata is written last (and copied to the server last) so the
+        # frontend never sees a run announced before its contours exist.
+        write_metadata(files_dir, date_str, hour, successes=successes, failures=failures)
+
+        total = successes + failures
+        logger.info("Run complete: %d/%d forecast hours processed", successes, total)
+        if successes == 0:
+            logger.error("All forecast hours failed; nothing to publish")
+            sys.exit(2)
+        if failures > total // 4:
+            logger.error(
+                "Too many failures (%d of %d); marking run as failed", failures, total
+            )
+            sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -36,27 +36,28 @@ if [ ! -f "$SSH_KEY_PATH" ]; then
     exit 1
 fi
 
+if ! command -v rsync >/dev/null; then
+    echo "Error: rsync is required (files must land atomically on the server)" >&2
+    exit 1
+fi
+
 shopt -s nullglob
-geojson_files=("$SOURCE_PATH"/*.geojson)
-json_files=("$SOURCE_PATH"/*.json)
+contour_files=("$SOURCE_PATH"/*.geojson "$SOURCE_PATH"/*.geojson.gz)
 shopt -u nullglob
 
-if [ ${#geojson_files[@]} -eq 0 ] && [ ${#json_files[@]} -eq 0 ]; then
-    echo "No files to copy from $SOURCE_PATH"
+if [ ${#contour_files[@]} -eq 0 ]; then
+    echo "No contour files to copy from $SOURCE_PATH"
     exit 0
 fi
 
-copy_files() {
-    local label="$1"
-    shift
-    local files=("$@")
-    if [ ${#files[@]} -eq 0 ]; then
-        return
-    fi
-    echo "Copying $label from $SOURCE_PATH to $DEST_PATH"
-    scp -i "$SSH_KEY_PATH" "${files[@]}" "$DEST_PATH"
-}
+# --delay-updates stages everything in a temp dir on the server and renames
+# at the end, so readers never see a truncated file mid-transfer.
+echo "Copying ${#contour_files[@]} contour files from $SOURCE_PATH to $DEST_PATH"
+rsync -t --delay-updates -e "ssh -i $SSH_KEY_PATH" "${contour_files[@]}" "$DEST_PATH"
 
-copy_files "geojson files" "${geojson_files[@]}"
-copy_files "json files" "${json_files[@]}"
-
+# metadata.json is copied last: it announces the run to the frontend, so it
+# must never arrive before the contours it describes.
+if [ -f "$SOURCE_PATH/metadata.json" ]; then
+    echo "Copying metadata.json"
+    rsync -t -e "ssh -i $SSH_KEY_PATH" "$SOURCE_PATH/metadata.json" "$DEST_PATH"
+fi
