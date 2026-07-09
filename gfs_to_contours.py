@@ -27,6 +27,14 @@ logger.setLevel(logging.INFO)
 
 _GRID_CACHE: dict[tuple, tuple[np.ndarray, np.ndarray]] = {}
 
+# Height bands shared with the frontend color scale and legend (meters).
+# Levels must be identical for every forecast hour: per-file derived levels
+# made the band boundaries shift between frames, so the animation flickered.
+# 20 m is a catch-all top for the "8 m+" band.
+FIXED_LEVELS = np.array(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0, 20.0]
+)
+
 
 def setup_logging(log_directory: str) -> None:
     if logger.handlers:
@@ -96,25 +104,19 @@ def _gaussian_filter_nan(array: np.ndarray, sigma: float) -> np.ndarray:
             out=np.full_like(filtered, np.nan),
             where=weights > 0,
         )
-    filtered[np.logical_and(nan_mask, weights == 0)] = np.nan
+    # Keep land cells NaN. The weighted filter extrapolates values into
+    # masked cells near the coast; leaving those in makes the contour
+    # polygons spill onto land in the map.
+    filtered[nan_mask] = np.nan
     return filtered
 
 
-def _derive_levels(values: np.ndarray, base_step: float = 0.5, max_levels: int = 60) -> np.ndarray:
-    valid = values[np.isfinite(values)]
-    if valid.size == 0:
-        raise ValueError("No valid data available for contouring.")
-    vmax = float(valid.max())
-    if vmax <= 0:
-        return np.array([0.0, base_step], dtype=float)
-    levels = np.arange(0.0, vmax + base_step, base_step, dtype=float)
-    if levels.size > max_levels:
-        levels = np.linspace(0.0, vmax, max_levels, dtype=float)
-    if levels[-1] < vmax:
-        levels = np.append(levels, vmax)
-    if levels.size < 2:
-        levels = np.array([0.0, vmax], dtype=float)
-    return levels
+def _write_geojson(payload: str, geojson_path: str) -> None:
+    with open(geojson_path, "w") as f:
+        f.write(payload)
+    # Precompressed sibling; the web app serves it when clients accept gzip.
+    with gzip.open(geojson_path + ".gz", "wt", encoding="utf-8", compresslevel=6) as f:
+        f.write(payload)
 
 
 def extract_from_grib2_to_np(filepath: str) -> dict:
@@ -162,10 +164,10 @@ def calculate_contours4(
     geojson_path: str,
     *,
     levels: np.ndarray | None = None,
-    smoothing_sigma: float = 1.0,
-    simplify_tolerance: float | None = None,
+    smoothing_sigma: float = 1.5,
+    simplify_tolerance: float | None = 0.02,
     min_area: float | None = None,
-    stride: int = 2,
+    stride: int = 1,
     extra_properties: dict | None = None,
 ) -> np.ndarray:
     lon_grid = data["lon"]
@@ -182,7 +184,7 @@ def calculate_contours4(
         lat_grid = lat_grid[::stride, ::stride]
 
     if levels is None:
-        levels = _derive_levels(grid)
+        levels = FIXED_LEVELS
 
     masked_data = np.ma.masked_invalid(grid)
     fig, ax = plt.subplots(figsize=(4, 2.5), dpi=100)
@@ -285,16 +287,59 @@ def calculate_contours4(
     if not features:
         logger.warning("No contour polygons generated for %s", geojson_path)
     feature_collection = FeatureCollection(features)
-    payload = geojson.dumps(feature_collection)
-    with open(geojson_path, "w") as f:
-        f.write(payload)
-    # Precompressed sibling; the web app serves it when clients accept gzip.
-    with gzip.open(geojson_path + ".gz", "wt", encoding="utf-8", compresslevel=6) as f:
-        f.write(payload)
+    _write_geojson(geojson.dumps(feature_collection), geojson_path)
     logger.info(
         "Contours saved to %s (%d polygons)", geojson_path, len(features)
     )
     return levels
+
+
+def extract_swell_arrows(
+    data: dict,
+    geojson_path: str,
+    *,
+    stride: int = 10,
+) -> int:
+    """Write a coarse grid of swell direction points for the given hour.
+
+    The map renders these as rotated arrows over the height contours.
+    Property names are single letters to keep the payload small:
+    h = significant height (m), p = mean period (s), d = direction the
+    swell comes from (degrees true).
+    """
+    lon = data["lon"][::stride, ::stride]
+    lat = data["lat"][::stride, ::stride]
+    height = data["height"][::stride, ::stride]
+    period = data["period"][::stride, ::stride]
+    direction = data["direction"][::stride, ::stride]
+    mask = data.get("height_mask")
+
+    valid = np.isfinite(height) & np.isfinite(period) & np.isfinite(direction)
+    if mask is not None:
+        valid &= ~mask[::stride, ::stride]
+
+    features = []
+    for lo, la, h, p, d in zip(
+        lon[valid], lat[valid], height[valid], period[valid], direction[valid]
+    ):
+        features.append(
+            Feature(
+                geometry={
+                    "type": "Point",
+                    # Same lon convention as the contours (GFS 0..360).
+                    "coordinates": [round(float(lo), 2), round(float(la), 2)],
+                },
+                properties={
+                    "h": round(float(h), 2),
+                    "p": round(float(p), 1),
+                    "d": int(round(float(d))) % 360,
+                },
+            )
+        )
+
+    _write_geojson(geojson.dumps(FeatureCollection(features)), geojson_path)
+    logger.info("Arrows saved to %s (%d points)", geojson_path, len(features))
+    return len(features)
 
 
 def find_latest_gfs_time(session: requests.Session | None = None) -> tuple[str, str]:
@@ -363,9 +408,10 @@ def process_forecast_hours(
     run_hour: str,
     files_dir: str,
     *,
-    stride: int = 2,
-    smoothing_sigma: float = 1.0,
-    simplify_tolerance: float | None = None,
+    stride: int = 1,
+    smoothing_sigma: float = 1.5,
+    simplify_tolerance: float | None = 0.02,
+    arrow_stride: int = 10,
     session: requests.Session | None = None,
 ) -> tuple[int, int]:
     base_url = (
@@ -407,6 +453,10 @@ def process_forecast_hours(
                     simplify_tolerance=simplify_tolerance,
                     extra_properties={"forecast_hour": int(forecast_hour)},
                 )
+                arrows_path = os.path.join(
+                    files_dir, f"arrows_{file_index}.geojson"
+                )
+                extract_swell_arrows(data, arrows_path, stride=arrow_stride)
                 successes += 1
             except Exception as exc:
                 failures += 1
@@ -450,10 +500,13 @@ def main() -> None:
 
     setup_logging(log_dir)
 
-    stride = max(int(os.environ.get("CONTOUR_STRIDE", "2") or 1), 1)
-    smoothing_sigma = float(os.environ.get("CONTOUR_SMOOTHING_SIGMA", "1.0") or 1.0)
+    # Full grid resolution (0.16 deg) with a touch more smoothing and light
+    # simplification: smooth coastline-accurate polygons at a manageable size.
+    stride = max(int(os.environ.get("CONTOUR_STRIDE", "1") or 1), 1)
+    smoothing_sigma = float(os.environ.get("CONTOUR_SMOOTHING_SIGMA", "1.5") or 1.5)
     simplify_env = os.environ.get("CONTOUR_SIMPLIFY_TOLERANCE")
-    simplify_tolerance = float(simplify_env) if simplify_env else None
+    simplify_tolerance = float(simplify_env) if simplify_env else 0.02
+    arrow_stride = max(int(os.environ.get("ARROW_STRIDE", "10") or 10), 1)
 
     with requests.Session() as session:
         date_str, hour = find_latest_gfs_time(session=session)
@@ -471,6 +524,7 @@ def main() -> None:
                 stride=stride,
                 smoothing_sigma=smoothing_sigma,
                 simplify_tolerance=simplify_tolerance,
+                arrow_stride=arrow_stride,
                 session=session,
             )
             successes += ok
