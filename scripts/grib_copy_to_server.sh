@@ -42,7 +42,7 @@ if ! command -v rsync >/dev/null; then
 fi
 
 shopt -s nullglob
-contour_files=("$SOURCE_PATH"/*.geojson "$SOURCE_PATH"/*.geojson.gz)
+contour_files=("$SOURCE_PATH"/*.geojson "$SOURCE_PATH"/*.geojson.gz "$SOURCE_PATH"/*.png)
 shopt -u nullglob
 
 if [ ${#contour_files[@]} -eq 0 ]; then

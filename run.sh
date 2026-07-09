@@ -45,7 +45,7 @@ copy_files_locally() {
     fi
 
     shopt -s nullglob
-    local contour_files=("$source_path"/*.geojson "$source_path"/*.geojson.gz)
+    local contour_files=("$source_path"/*.geojson "$source_path"/*.geojson.gz "$source_path"/*.png)
     shopt -u nullglob
 
     if [ ${#contour_files[@]} -eq 0 ]; then

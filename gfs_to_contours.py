@@ -17,6 +17,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.path import Path
 
+from PIL import Image as PILImage
+
 from geojson import Feature, FeatureCollection
 from shapely.geometry import Polygon
 from shapely.ops import transform as shapely_transform
@@ -34,6 +36,17 @@ _GRID_CACHE: dict[tuple, tuple[np.ndarray, np.ndarray]] = {}
 FIXED_LEVELS = np.array(
     [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0, 20.0]
 )
+
+# Continuous color ramp for the heatmap PNGs. Colors match SWELL_BANDS in
+# the web app's pages/today.html (change them together); each color is
+# anchored at its band's midpoint so the legend stays truthful.
+HEATMAP_ANCHORS = np.array(
+    [0.25, 0.75, 1.25, 1.75, 2.25, 2.75, 3.5, 4.5, 5.5, 7.0, 10.0]
+)
+HEATMAP_COLORS = [
+    "#a5d5f0", "#64a8e8", "#3178d2", "#15a3a3", "#2fb54e", "#a3c520",
+    "#f2ce08", "#f59a0b", "#ea4b28", "#b31212", "#4a0a1e",
+]
 
 
 def setup_logging(log_directory: str) -> None:
@@ -109,6 +122,72 @@ def _gaussian_filter_nan(array: np.ndarray, sigma: float) -> np.ndarray:
     # polygons spill onto land in the map.
     filtered[nan_mask] = np.nan
     return filtered
+
+
+def _hex_to_rgb(color: str) -> tuple[int, int, int]:
+    color = color.lstrip("#")
+    return (int(color[0:2], 16), int(color[2:4], 16), int(color[4:6], 16))
+
+
+def render_heatmap_png(
+    data: dict,
+    png_path: str,
+    *,
+    rows_scale: float = 2.0,
+) -> dict:
+    """Render the height field as a continuous-color PNG heatmap.
+
+    MapLibre stretches an image source linearly in Web Mercator space, so
+    rows are resampled here from the equirectangular GRIB grid to equal
+    Mercator spacing; displaying the PNG at the returned bounds then puts
+    every pixel at the correct latitude. Land is transparent.
+    """
+    height = data["height"].astype(np.float32, copy=False)
+    mask = data.get("height_mask")
+    grid = np.where(mask, np.nan, height) if mask is not None else height
+
+    lats = data["lat"][:, 0].astype(np.float64)
+    lons = data["lon"][0, :].astype(np.float64)
+    if lats[0] < lats[-1]:  # rows must run north -> south for the image
+        lats = lats[::-1]
+        grid = grid[::-1, :]
+
+    def merc_y(lat_deg: np.ndarray) -> np.ndarray:
+        return np.log(np.tan(np.pi / 4 + np.radians(lat_deg) / 2))
+
+    n_rows = int(grid.shape[0] * rows_scale)
+    y_targets = np.linspace(merc_y(lats[0]), merc_y(lats[-1]), n_rows)
+    target_lats = np.degrees(2 * np.arctan(np.exp(y_targets)) - np.pi / 2)
+    # Nearest source row per target row keeps the land/sea edge crisp.
+    src_rows = np.abs(target_lats[:, None] - lats[None, :]).argmin(axis=1)
+    warped = grid[src_rows, :]
+
+    colors = np.array([_hex_to_rgb(c) for c in HEATMAP_COLORS], dtype=np.float64)
+    values = np.clip(
+        np.nan_to_num(warped, nan=HEATMAP_ANCHORS[0]),
+        HEATMAP_ANCHORS[0],
+        HEATMAP_ANCHORS[-1],
+    )
+    rgba = np.zeros((*warped.shape, 4), dtype=np.uint8)
+    for channel in range(3):
+        rgba[..., channel] = np.interp(
+            values, HEATMAP_ANCHORS, colors[:, channel]
+        ).astype(np.uint8)
+    rgba[..., 3] = np.where(np.isnan(warped), 0, 255).astype(np.uint8)
+
+    # Palette quantization cuts the PNG ~3x with no visible difference;
+    # the ramp itself only spans a few hundred distinct colors.
+    image = PILImage.fromarray(rgba, "RGBA").quantize(
+        colors=256, method=PILImage.Quantize.FASTOCTREE, dither=PILImage.Dither.NONE
+    )
+    image.save(png_path, optimize=True)
+    logger.info("Heatmap saved to %s (%dx%d)", png_path, rgba.shape[1], rgba.shape[0])
+    return {
+        "west": float(lons[0]),
+        "east": float(lons[-1]),
+        "north": float(lats[0]),
+        "south": float(lats[-1]),
+    }
 
 
 def _write_geojson(payload: str, geojson_path: str) -> None:
@@ -384,6 +463,7 @@ def write_metadata(
     hour: str,
     successes: int | None = None,
     failures: int | None = None,
+    heatmap_bounds: dict | None = None,
 ) -> str:
     metadata_path = os.path.join(files_dir, "metadata.json")
     metadata: dict[str, object] = {
@@ -396,6 +476,9 @@ def write_metadata(
         metadata["hours_processed"] = successes
     if failures is not None:
         metadata["hours_failed"] = failures
+    if heatmap_bounds is not None:
+        # The web app pins the heatmap PNGs to these corner coordinates.
+        metadata["heatmap_bounds"] = heatmap_bounds
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
     logger.info("Saved metadata to %s", metadata_path)
@@ -413,6 +496,7 @@ def process_forecast_hours(
     simplify_tolerance: float | None = 0.02,
     arrow_stride: int = 10,
     session: requests.Session | None = None,
+    run_info: dict | None = None,
 ) -> tuple[int, int]:
     base_url = (
         "https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/"
@@ -457,6 +541,12 @@ def process_forecast_hours(
                     files_dir, f"arrows_{file_index}.geojson"
                 )
                 extract_swell_arrows(data, arrows_path, stride=arrow_stride)
+                heatmap_path = os.path.join(
+                    files_dir, f"heatmap_{file_index}.png"
+                )
+                bounds = render_heatmap_png(data, heatmap_path)
+                if run_info is not None:
+                    run_info.setdefault("heatmap_bounds", bounds)
                 successes += 1
             except Exception as exc:
                 failures += 1
@@ -515,6 +605,7 @@ def main() -> None:
         )
         successes = 0
         failures = 0
+        run_info: dict = {}
         for hour_sequence in (range(0, 121, 3), range(123, 387, 3)):
             ok, failed = process_forecast_hours(
                 hour_sequence,
@@ -526,13 +617,21 @@ def main() -> None:
                 simplify_tolerance=simplify_tolerance,
                 arrow_stride=arrow_stride,
                 session=session,
+                run_info=run_info,
             )
             successes += ok
             failures += failed
 
         # Metadata is written last (and copied to the server last) so the
         # frontend never sees a run announced before its contours exist.
-        write_metadata(files_dir, date_str, hour, successes=successes, failures=failures)
+        write_metadata(
+            files_dir,
+            date_str,
+            hour,
+            successes=successes,
+            failures=failures,
+            heatmap_bounds=run_info.get("heatmap_bounds"),
+        )
 
         total = successes + failures
         logger.info("Run complete: %d/%d forecast hours processed", successes, total)
