@@ -124,6 +124,36 @@ def _gaussian_filter_nan(array: np.ndarray, sigma: float) -> np.ndarray:
     return filtered
 
 
+_progress_tty = None
+_progress_tty_tried = False
+
+
+def _print_progress(done: int, total: int, label: str) -> None:
+    """Draw a progress bar on the controlling terminal when GRIB_PROGRESS=1.
+
+    Writes to /dev/tty directly: run.sh redirects stdout/stderr into the run
+    log, and \\r control characters don't belong in a log file. Under systemd
+    (no terminal) this is a no-op.
+    """
+    global _progress_tty, _progress_tty_tried
+    if not os.environ.get("GRIB_PROGRESS") or total <= 0:
+        return
+    if not _progress_tty_tried:
+        _progress_tty_tried = True
+        try:
+            _progress_tty = open("/dev/tty", "w")
+        except OSError:
+            _progress_tty = None
+    if _progress_tty is None:
+        return
+    width = 30
+    filled = int(width * done / total)
+    bar = "#" * filled + "-" * (width - filled)
+    end = "\n" if done >= total else ""
+    _progress_tty.write(f"\r[{bar}] {done}/{total} {label:<18}{end}")
+    _progress_tty.flush()
+
+
 def _hex_to_rgb(color: str) -> tuple[int, int, int]:
     color = color.lstrip("#")
     return (int(color[0:2], 16), int(color[2:4], 16), int(color[4:6], 16))
@@ -168,20 +198,31 @@ def render_heatmap_png(
         HEATMAP_ANCHORS[0],
         HEATMAP_ANCHORS[-1],
     )
-    rgba = np.zeros((*warped.shape, 4), dtype=np.uint8)
-    for channel in range(3):
-        rgba[..., channel] = np.interp(
-            values, HEATMAP_ANCHORS, colors[:, channel]
-        ).astype(np.uint8)
-    rgba[..., 3] = np.where(np.isnan(warped), 0, 255).astype(np.uint8)
 
-    # Palette quantization cuts the PNG ~3x with no visible difference;
-    # the ramp itself only spans a few hundred distinct colors.
-    image = PILImage.fromarray(rgba, "RGBA").quantize(
-        colors=256, method=PILImage.Quantize.FASTOCTREE, dither=PILImage.Dither.NONE
-    )
-    image.save(png_path, optimize=True)
-    logger.info("Heatmap saved to %s (%dx%d)", png_path, rgba.shape[1], rgba.shape[0])
+    # Write an indexed-color PNG with a palette built directly from the ramp:
+    # index 0 is transparent land, indices 1..255 are evenly spaced ramp
+    # steps (~0.04 m apart). Letting Pillow *derive* a palette (quantize) is
+    # not safe here — its octree merged rare colors (8 m+ storm cores) into
+    # the transparent slot, punching holes in the heatmap. A fixed palette
+    # keeps the file ~5x smaller than true RGBA with exact transparency.
+    steps = 255
+    ramp_values = np.linspace(HEATMAP_ANCHORS[0], HEATMAP_ANCHORS[-1], steps)
+    palette = np.zeros((256, 3), dtype=np.uint8)
+    for channel in range(3):
+        palette[1:, channel] = np.interp(
+            ramp_values, HEATMAP_ANCHORS, colors[:, channel]
+        ).astype(np.uint8)
+
+    fraction = (values - HEATMAP_ANCHORS[0]) / (HEATMAP_ANCHORS[-1] - HEATMAP_ANCHORS[0])
+    indices = (1 + np.round(fraction * (steps - 1))).astype(np.uint8)
+    indices[np.isnan(warped)] = 0
+
+    # fromarray yields mode "L"; putpalette converts it to "P" in place.
+    # (Passing mode= to fromarray is deprecated and gone in Pillow 13.)
+    image = PILImage.fromarray(indices)
+    image.putpalette(palette.flatten())
+    image.save(png_path, optimize=True, transparency=0)
+    logger.info("Heatmap saved to %s (%dx%d)", png_path, indices.shape[1], indices.shape[0])
     return {
         "west": float(lons[0]),
         "east": float(lons[-1]),
@@ -204,11 +245,13 @@ def extract_from_grib2_to_np(filepath: str) -> dict:
         height_param_name = "Significant height of total swell"
         period_param_name = "Mean period of total swell"
         direction_param_name = "Direction of swell waves"
+        combined_param_name = "Significant height of combined wind waves and swell"
 
         try:
             height_msg = grbs.select(name=height_param_name)[0]
             period_msg = grbs.select(name=period_param_name)[0]
             direction_msg = grbs.select(name=direction_param_name)[0]
+            combined_msg = grbs.select(name=combined_param_name)[0]
         except (IndexError, ValueError) as exc:
             raise RuntimeError(f"Missing required fields in {filepath}") from exc
 
@@ -216,14 +259,27 @@ def extract_from_grib2_to_np(filepath: str) -> dict:
             height_msg.validDate
             == period_msg.validDate
             == direction_msg.validDate
+            == combined_msg.validDate
         ):
             raise ValueError("Mismatched valid times between GRIB fields")
 
         lon_grid, lat_grid = _get_lat_lon_grid(height_msg)
-        height_values = np.ma.filled(height_msg.values, np.nan).astype(np.float32)
+        swell_values = np.ma.filled(height_msg.values, np.nan)
+        combined_values = np.ma.filled(combined_msg.values, np.nan)
+        swell_mask = np.ma.getmaskarray(height_msg.values)
+        combined_mask = np.ma.getmaskarray(combined_msg.values)
         period_values = np.ma.filled(period_msg.values, np.nan).astype(np.float32)
         direction_values = np.ma.filled(direction_msg.values, np.nan).astype(np.float32)
-        mask = np.ma.getmaskarray(height_msg.values)
+
+        # The swell partition is undefined where the sea state is pure wind
+        # sea — which is exactly the core of a storm (heights up to 15 m+
+        # live only in the combined field there). Fall back to the combined
+        # significant height so heatmaps/contours have no holes over open
+        # water; the combined field's mask is the true land mask.
+        height_values = np.where(
+            swell_mask & ~combined_mask, combined_values, swell_values
+        ).astype(np.float32)
+        mask = combined_mask
 
         return {
             "lon": lon_grid,
@@ -510,9 +566,11 @@ def process_forecast_hours(
 
     successes = 0
     failures = 0
+    hours = list(hour_sequence)
     try:
-        for forecast_hour in hour_sequence:
+        for done, forecast_hour in enumerate(hours, start=1):
             file_index = f"{int(forecast_hour):03}"
+            _print_progress(done - 1, len(hours), f"f{file_index}")
             file_name = f"gfswave.t{run_hour}z.global.0p16.f{file_index}.grib2"
             file_path = os.path.join(files_dir, file_name)
             geojson_path = os.path.join(files_dir, f"contours_{file_index}.geojson")
@@ -553,6 +611,9 @@ def process_forecast_hours(
                 logger.error(
                     "Error processing file %s: %s", file_index, exc, exc_info=True
                 )
+        _print_progress(
+            len(hours), len(hours), f"done ({failures} failed)" if failures else "done"
+        )
     finally:
         if own_session:
             session.close()
@@ -603,24 +664,29 @@ def main() -> None:
         logger.info(
             "Found latest GFS wave data for date %s hour %sZ", date_str, hour
         )
-        successes = 0
-        failures = 0
         run_info: dict = {}
-        for hour_sequence in (range(0, 121, 3), range(123, 387, 3)):
-            ok, failed = process_forecast_hours(
-                hour_sequence,
-                date_str,
-                hour,
-                files_dir,
-                stride=stride,
-                smoothing_sigma=smoothing_sigma,
-                simplify_tolerance=simplify_tolerance,
-                arrow_stride=arrow_stride,
-                session=session,
-                run_info=run_info,
+        # One combined sequence so the --verbose progress bar spans the run.
+        hour_sequence = list(range(0, 121, 3)) + list(range(123, 387, 3))
+        # run.sh --limit <n>: only the first n hours, for quick local checks.
+        limit = int(os.environ.get("GRIB_LIMIT", "0") or 0)
+        if limit > 0:
+            hour_sequence = hour_sequence[:limit]
+            logger.info(
+                "GRIB_LIMIT set: processing only the first %d forecast hours",
+                len(hour_sequence),
             )
-            successes += ok
-            failures += failed
+        successes, failures = process_forecast_hours(
+            hour_sequence,
+            date_str,
+            hour,
+            files_dir,
+            stride=stride,
+            smoothing_sigma=smoothing_sigma,
+            simplify_tolerance=simplify_tolerance,
+            arrow_stride=arrow_stride,
+            session=session,
+            run_info=run_info,
+        )
 
         # Metadata is written last (and copied to the server last) so the
         # frontend never sees a run announced before its contours exist.

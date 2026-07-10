@@ -40,6 +40,11 @@ SSH_KEY_PATH=/etc/ssh/ssh_host_ed25519_key
 See `../webgl-swell-rendering.md` for the possible next step (client-side
 WebGL rendering with temporal interpolation).
 
+`run.sh --verbose` draws a live progress bar in the terminal (the log is
+unaffected); `--local` copies output to the sibling open-swells-app instead
+of the server; `--limit <n>` processes only the first n forecast hours for
+quick render checks (don't publish a limited run to the server).
+
 **Optional tuning env vars**:
 ```
 CONTOUR_STRIDE=2               # grid downsampling for contours

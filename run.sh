@@ -1,16 +1,31 @@
 #!/usr/bin/env bash
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOCAL=false
+VERBOSE=false
+LIMIT=0
 LOCAL_DEST_PATH="${LOCAL_DEST_PATH:-"$SCRIPT_DIR/../open-swells-app/static"}"
 
 usage() {
-    echo "Usage: $0 [--local]"
+    echo "Usage: $0 [--local] [--verbose] [--limit <n>]"
+    echo "  --limit <n>  only process the first n forecast hours (quick checks)"
 }
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --local)
             LOCAL=true
+            ;;
+        --verbose)
+            VERBOSE=true
+            ;;
+        --limit)
+            shift
+            if [ "$#" -eq 0 ] || ! [[ "$1" =~ ^[0-9]+$ ]] || [ "$1" -lt 1 ]; then
+                echo "Error: --limit requires a positive integer" >&2
+                usage >&2
+                exit 1
+            fi
+            LIMIT="$1"
             ;;
         -h|--help)
             usage
@@ -63,6 +78,16 @@ copy_files_locally() {
 }
 
 mkdir -p "$SCRIPT_DIR/logs"
+if [ "$LIMIT" -gt 0 ]; then
+    export GRIB_LIMIT="$LIMIT"
+    echo "Limiting run to the first $LIMIT forecast hours"
+fi
+if [ "$VERBOSE" = true ]; then
+    # The parser draws a progress bar on /dev/tty; the full output still
+    # goes only to the log so control characters never end up in it.
+    export GRIB_PROGRESS=1
+    echo "Progress will display here; full log: $SCRIPT_DIR/logs/grib-run.log"
+fi
 exec >>"$SCRIPT_DIR/logs/grib-run.log" 2>&1
 echo "==== $(date -Is) START $$ ===="
 
