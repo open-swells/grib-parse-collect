@@ -24,6 +24,9 @@ from shapely.geometry import Polygon
 from shapely.ops import transform as shapely_transform
 from scipy.ndimage import gaussian_filter
 
+from tides import write_tides
+from wind import extract_wind, write_wind_arrows
+
 logger = logging.getLogger("GFSWaveContours")
 logger.setLevel(logging.INFO)
 
@@ -248,28 +251,42 @@ def extract_from_grib2_to_np(filepath: str) -> dict:
         combined_param_name = "Significant height of combined wind waves and swell"
 
         try:
-            height_msg = grbs.select(name=height_param_name)[0]
-            period_msg = grbs.select(name=period_param_name)[0]
-            direction_msg = grbs.select(name=direction_param_name)[0]
+            height_msgs = grbs.select(name=height_param_name)
+            period_msgs = grbs.select(name=period_param_name)
+            direction_msgs = grbs.select(name=direction_param_name)
             combined_msg = grbs.select(name=combined_param_name)[0]
         except (IndexError, ValueError) as exc:
             raise RuntimeError(f"Missing required fields in {filepath}") from exc
 
-        if not (
-            height_msg.validDate
-            == period_msg.validDate
-            == direction_msg.validDate
-            == combined_msg.validDate
-        ):
+        if not (len(height_msgs) == len(period_msgs) == len(direction_msgs) == 3):
+            raise RuntimeError(f"Expected three swell partitions in {filepath}")
+        partition_messages = [
+            message
+            for group in (height_msgs, period_msgs, direction_msgs)
+            for message in group
+        ]
+        if any(message.validDate != combined_msg.validDate for message in partition_messages):
             raise ValueError("Mismatched valid times between GRIB fields")
 
+        height_msg = height_msgs[0]
         lon_grid, lat_grid = _get_lat_lon_grid(height_msg)
         swell_values = np.ma.filled(height_msg.values, np.nan)
         combined_values = np.ma.filled(combined_msg.values, np.nan)
         swell_mask = np.ma.getmaskarray(height_msg.values)
         combined_mask = np.ma.getmaskarray(combined_msg.values)
-        period_values = np.ma.filled(period_msg.values, np.nan).astype(np.float32)
-        direction_values = np.ma.filled(direction_msg.values, np.nan).astype(np.float32)
+        partitions = []
+        for sequence, (partition_height, partition_period, partition_direction) in enumerate(
+            zip(height_msgs, period_msgs, direction_msgs), start=1
+        ):
+            partitions.append(
+                {
+                    "sequence": sequence,
+                    "height": np.ma.filled(partition_height.values, np.nan).astype(np.float32),
+                    "period": np.ma.filled(partition_period.values, np.nan).astype(np.float32),
+                    "direction": np.ma.filled(partition_direction.values, np.nan).astype(np.float32),
+                    "mask": np.ma.getmaskarray(partition_height.values),
+                }
+            )
 
         # The swell partition is undefined where the sea state is pure wind
         # sea — which is exactly the core of a storm (heights up to 15 m+
@@ -286,8 +303,9 @@ def extract_from_grib2_to_np(filepath: str) -> dict:
             "lat": lat_grid,
             "height": height_values,
             "height_mask": mask,
-            "period": period_values,
-            "direction": direction_values,
+            "period": partitions[0]["period"],
+            "direction": partitions[0]["direction"],
+            "swell_partitions": partitions,
             "valid_date": height_msg.validDate,
         }
     finally:
@@ -477,6 +495,44 @@ def extract_swell_arrows(
     return len(features)
 
 
+def extract_partition_arrows(data: dict, geojson_path: str, *, stride: int = 10) -> int:
+    """Write all three swell partitions at each valid coarse-grid point."""
+    lon = data["lon"][::stride, ::stride]
+    lat = data["lat"][::stride, ::stride]
+    sampled_partitions = [
+        {
+            "sequence": partition["sequence"],
+            "height": partition["height"][::stride, ::stride],
+            "period": partition["period"][::stride, ::stride],
+            "direction": partition["direction"][::stride, ::stride],
+        }
+        for partition in data["swell_partitions"]
+    ]
+    features = []
+    for row, column in np.ndindex(lon.shape):
+        properties = {}
+        for partition in sampled_partitions:
+            index = partition["sequence"]
+            h = partition["height"][row, column]
+            p = partition["period"][row, column]
+            d = partition["direction"][row, column]
+            if np.isfinite(h) and np.isfinite(p) and np.isfinite(d):
+                properties[f"h{index}"] = round(float(h), 2)
+                properties[f"p{index}"] = round(float(p), 1)
+                properties[f"d{index}"] = int(round(float(d))) % 360
+        if not properties:
+            continue
+        features.append(
+            Feature(
+                geometry={"type": "Point", "coordinates": [round(float(lon[row, column]), 2), round(float(lat[row, column]), 2)]},
+                properties=properties,
+            )
+        )
+    _write_geojson(geojson.dumps(FeatureCollection(features)), geojson_path)
+    logger.info("Swell partitions saved to %s (%d points)", geojson_path, len(features))
+    return len(features)
+
+
 def find_latest_gfs_time(session: requests.Session | None = None) -> tuple[str, str]:
     hours = ["18", "12", "06", "00"]
     base_url = "https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/"
@@ -599,6 +655,11 @@ def process_forecast_hours(
                     files_dir, f"arrows_{file_index}.geojson"
                 )
                 extract_swell_arrows(data, arrows_path, stride=arrow_stride)
+                partition_path = os.path.join(files_dir, f"swell_partitions_{file_index}.geojson")
+                extract_partition_arrows(data, partition_path, stride=arrow_stride)
+                wind_data = extract_wind(file_path)
+                wind_path = os.path.join(files_dir, f"wind_{file_index}.geojson")
+                write_wind_arrows(wind_data, wind_path, stride=arrow_stride)
                 heatmap_path = os.path.join(
                     files_dir, f"heatmap_{file_index}.png"
                 )
@@ -687,6 +748,22 @@ def main() -> None:
             session=session,
             run_info=run_info,
         )
+
+        tide_stations = [
+            station.strip()
+            for station in os.environ.get("TIDE_STATIONS", "").split(",")
+            if station.strip()
+        ]
+        tide_path = os.path.join(files_dir, "tides.json")
+        if tide_stations:
+            write_tides(session, tide_stations, tide_path)
+        else:
+            logger.info("TIDE_STATIONS is empty; skipping NOAA CO-OPS tide data")
+            # Do not republish a file from an older configuration/run.
+            try:
+                os.remove(tide_path)
+            except FileNotFoundError:
+                pass
 
         # Metadata is written last (and copied to the server last) so the
         # frontend never sees a run announced before its contours exist.

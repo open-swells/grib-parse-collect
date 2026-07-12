@@ -44,20 +44,24 @@ fi
 shopt -s nullglob
 contour_files=("$SOURCE_PATH"/*.geojson "$SOURCE_PATH"/*.geojson.gz "$SOURCE_PATH"/*.png)
 shopt -u nullglob
-
-if [ ${#contour_files[@]} -eq 0 ]; then
-    echo "No contour files to copy from $SOURCE_PATH"
-    exit 0
+if [ -f "$SOURCE_PATH/tides.json" ]; then
+    contour_files+=("$SOURCE_PATH/tides.json")
 fi
 
-# --delay-updates stages everything in a temp dir on the server and renames
-# at the end, so readers never see a truncated file mid-transfer.
-echo "Copying ${#contour_files[@]} contour files from $SOURCE_PATH to $DEST_PATH"
-rsync -t --delay-updates -e "ssh -i $SSH_KEY_PATH" "${contour_files[@]}" "$DEST_PATH"
+if [ ${#contour_files[@]} -gt 0 ]; then
+    # --delay-updates stages everything in a temp dir on the server and renames
+    # at the end, so readers never see a truncated file mid-transfer.
+    echo "Copying ${#contour_files[@]} contour files from $SOURCE_PATH to $DEST_PATH"
+    rsync -t --delay-updates -e "ssh -i $SSH_KEY_PATH" "${contour_files[@]}" "$DEST_PATH"
+else
+    echo "No contour files to copy from $SOURCE_PATH"
+fi
 
 # metadata.json is copied last: it announces the run to the frontend, so it
 # must never arrive before the contours it describes.
 if [ -f "$SOURCE_PATH/metadata.json" ]; then
     echo "Copying metadata.json"
     rsync -t -e "ssh -i $SSH_KEY_PATH" "$SOURCE_PATH/metadata.json" "$DEST_PATH"
+elif [ ${#contour_files[@]} -eq 0 ]; then
+    echo "No metadata.json to copy from $SOURCE_PATH"
 fi

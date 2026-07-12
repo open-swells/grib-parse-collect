@@ -62,18 +62,22 @@ copy_files_locally() {
     shopt -s nullglob
     local contour_files=("$source_path"/*.geojson "$source_path"/*.geojson.gz "$source_path"/*.png)
     shopt -u nullglob
-
-    if [ ${#contour_files[@]} -eq 0 ]; then
-        echo "No contour files to copy from $source_path"
-        exit 0
+    if [ -f "$source_path/tides.json" ]; then
+        contour_files+=("$source_path/tides.json")
     fi
 
-    echo "Copying ${#contour_files[@]} contour files from $source_path to $dest_path"
-    rsync -t --delay-updates "${contour_files[@]}" "$dest_path/"
+    if [ ${#contour_files[@]} -gt 0 ]; then
+        echo "Copying ${#contour_files[@]} contour files from $source_path to $dest_path"
+        rsync -t --delay-updates "${contour_files[@]}" "$dest_path/"
+    else
+        echo "No contour files to copy from $source_path"
+    fi
 
     if [ -f "$source_path/metadata.json" ]; then
         echo "Copying metadata.json"
         rsync -t "$source_path/metadata.json" "$dest_path/"
+    elif [ ${#contour_files[@]} -eq 0 ]; then
+        echo "No metadata.json to copy from $source_path"
     fi
 }
 

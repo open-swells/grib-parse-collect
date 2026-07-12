@@ -35,6 +35,16 @@ SSH_KEY_PATH=/etc/ssh/ssh_host_ed25519_key
   missing.
 - `arrows_XXX.geojson` (+`.gz`) — coarse grid of swell direction points
   (properties `h`=height m, `p`=period s, `d`=direction from, deg true);
+- `swell_partitions_XXX.geojson` (+`.gz`) — all three swell systems. Compact
+  properties `h1`/`p1`/`d1` through `h3`/`p3`/`d3` are height in meters,
+  period in seconds, and direction from in degrees true.
+- `wind_XXX.geojson` (+`.gz`) — surface wind points from the GFS-Wave file.
+  Properties are `s` speed in m/s, `d` direction from in degrees true, and
+  `u`/`v` components in m/s.
+- `tides.json` — NOAA CO-OPS hourly astronomical predictions and the latest
+  48 hours of observed water levels, in meters relative to MLLW and UTC.
+  Set `TIDE_STATIONS` to comma-separated CO-OPS station IDs to generate it,
+  for example `TIDE_STATIONS=9410230,9410840`.
   also drives the app's hover readout.
 
 See `../webgl-swell-rendering.md` for the possible next step (client-side
