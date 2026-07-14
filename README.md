@@ -25,13 +25,13 @@ SSH_KEY_PATH=/etc/ssh/ssh_host_ed25519_key
 ```
 
 **Outputs per forecast hour**:
-- `heatmap_XXX.png` — continuous-color height field in Web Mercator with
-  transparent land; the app's primary swell layer. Corner coordinates are
-  published as `heatmap_bounds` in `metadata.json`. Colors come from
-  `HEATMAP_COLORS` in `gfs_to_contours.py`, matched by `SWELL_BANDS` in the
-  web app's `pages/today.html` — change them together.
-- `contours_XXX.geojson` (+`.gz`) — swell height polygons on fixed bands
-  (`FIXED_LEVELS`); kept as the app's fallback layer when heatmaps are
+- `heatmap_XXX.png` — continuous-color combined wind-wave-and-swell height
+  field in Web Mercator with transparent land; the app's primary wave layer.
+  Corner coordinates are published as `heatmap_bounds` in `metadata.json`.
+  Colors come from `HEATMAP_COLORS` in `gfs_to_contours.py`, matched by
+  `SWELL_BANDS` in the web app's `pages/today.html` — change them together.
+- `contours_XXX.geojson` (+`.gz`) — combined wave-height polygons on fixed
+  bands (`FIXED_LEVELS`); kept as the app's fallback layer when heatmaps are
   missing.
 - `arrows_XXX.geojson` (+`.gz`) — coarse grid of swell direction points
   (properties `h`=height m, `p`=period s, `d`=direction from, deg true);

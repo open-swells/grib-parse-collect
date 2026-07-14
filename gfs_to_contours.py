@@ -270,9 +270,7 @@ def extract_from_grib2_to_np(filepath: str) -> dict:
 
         height_msg = height_msgs[0]
         lon_grid, lat_grid = _get_lat_lon_grid(height_msg)
-        swell_values = np.ma.filled(height_msg.values, np.nan)
         combined_values = np.ma.filled(combined_msg.values, np.nan)
-        swell_mask = np.ma.getmaskarray(height_msg.values)
         combined_mask = np.ma.getmaskarray(combined_msg.values)
         partitions = []
         for sequence, (partition_height, partition_period, partition_direction) in enumerate(
@@ -288,15 +286,15 @@ def extract_from_grib2_to_np(filepath: str) -> dict:
                 }
             )
 
-        # The swell partition is undefined where the sea state is pure wind
-        # sea — which is exactly the core of a storm (heights up to 15 m+
-        # live only in the combined field there). Fall back to the combined
-        # significant height so heatmaps/contours have no holes over open
-        # water; the combined field's mask is the true land mask.
-        height_values = np.where(
-            swell_mask & ~combined_mask, combined_values, swell_values
-        ).astype(np.float32)
-        mask = combined_mask
+        # Render the complete sea state, not a mixture of swell partition 1
+        # and the combined field. Partition 1 can remain valid in a storm eye
+        # while reporting only a small background swell (for example 0.4 m
+        # beside 9 m combined seas). Using it whenever it is merely unmasked
+        # punches pale, apparently transparent holes into storm cores. The
+        # combined field is continuous across both wind sea and swell; keep
+        # the individual partitions below for the directional-arrow output.
+        height_values = combined_values.astype(np.float32)
+        mask = combined_mask | ~np.isfinite(combined_values)
 
         return {
             "lon": lon_grid,
@@ -462,14 +460,14 @@ def extract_swell_arrows(
     """
     lon = data["lon"][::stride, ::stride]
     lat = data["lat"][::stride, ::stride]
-    height = data["height"][::stride, ::stride]
-    period = data["period"][::stride, ::stride]
-    direction = data["direction"][::stride, ::stride]
-    mask = data.get("height_mask")
+    primary_partition = data["swell_partitions"][0]
+    height = primary_partition["height"][::stride, ::stride]
+    period = primary_partition["period"][::stride, ::stride]
+    direction = primary_partition["direction"][::stride, ::stride]
+    mask = primary_partition["mask"]
 
     valid = np.isfinite(height) & np.isfinite(period) & np.isfinite(direction)
-    if mask is not None:
-        valid &= ~mask[::stride, ::stride]
+    valid &= ~mask[::stride, ::stride]
 
     features = []
     for lo, la, h, p, d in zip(
