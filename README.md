@@ -24,6 +24,13 @@ LOG_DIR=...../grib-parse-collect/logs
 SSH_KEY_PATH=/etc/ssh/ssh_host_ed25519_key
 ```
 
+**Source grids**: every layer is a composite of two NOAA GFS-Wave products —
+`global.0p16` (1/6°, but only 15S–52.5N) inside its band and `global.0p25`
+(1/4°, pole-to-pole) everywhere else, merged onto one 1/6° lattice clipped
+to ±85° (see `composite.py`; the other regional products add nothing beyond
+these two). Both files are downloaded per forecast hour; if one is missing
+the hour degrades to partial coverage instead of failing.
+
 **Outputs per forecast hour**:
 - `heatmap_XXX.png` — continuous-color combined wind-wave-and-swell height
   field in Web Mercator with transparent land; the app's primary wave layer.

@@ -24,6 +24,7 @@ from shapely.geometry import Polygon
 from shapely.ops import transform as shapely_transform
 from scipy.ndimage import gaussian_filter
 
+from composite import composite_swell, composite_wind
 from tides import write_tides
 from wind import extract_wind, write_wind_arrows
 
@@ -31,6 +32,11 @@ logger = logging.getLogger("GFSWaveContours")
 logger.setLevel(logging.INFO)
 
 _GRID_CACHE: dict[tuple, tuple[np.ndarray, np.ndarray]] = {}
+
+# The two NOAA wave grids composited for whole-map coverage: the fine
+# grid only spans 15S-52.5N, the coarse one is pole-to-pole (see
+# composite.py for why the other regional products are not used).
+GLOBAL_GRIDS = ("global.0p16", "global.0p25")
 
 # Height bands shared with the frontend color scale and legend (meters).
 # Levels must be identical for every forecast hour: per-file derived levels
@@ -547,17 +553,21 @@ def find_latest_gfs_time(session: requests.Session | None = None) -> tuple[str, 
             for hour in hours:
                 # NOAA uploads forecast hours progressively; the run directory
                 # appears long before it is complete. Probe the last forecast
-                # hour we consume so we never process a half-uploaded run.
-                test_url = (
-                    f"{base_url}gfs.{date_str}/{hour}/wave/gridded/"
-                    f"gfswave.t{hour}z.global.0p16.f384.grib2"
-                )
+                # hour of both global grids we consume so we never process a
+                # half-uploaded run.
                 try:
-                    response = session.head(test_url, timeout=10)
-                    if response.status_code == 200:
+                    if all(
+                        session.head(
+                            f"{base_url}gfs.{date_str}/{hour}/wave/gridded/"
+                            f"gfswave.t{hour}z.{grid}.f384.grib2",
+                            timeout=10,
+                        ).status_code
+                        == 200
+                        for grid in GLOBAL_GRIDS
+                    ):
                         return date_str, hour
                 except requests.RequestException as exc:
-                    logger.debug("HEAD request failed for %s: %s", test_url, exc)
+                    logger.debug("HEAD request failed for run %s %sZ: %s", date_str, hour, exc)
                     continue
             current_date -= timedelta(days=1)
     finally:
@@ -625,22 +635,42 @@ def process_forecast_hours(
         for done, forecast_hour in enumerate(hours, start=1):
             file_index = f"{int(forecast_hour):03}"
             _print_progress(done - 1, len(hours), f"f{file_index}")
-            file_name = f"gfswave.t{run_hour}z.global.0p16.f{file_index}.grib2"
-            file_path = os.path.join(files_dir, file_name)
             geojson_path = os.path.join(files_dir, f"contours_{file_index}.geojson")
 
-            if not os.path.exists(file_path):
-                url = f"{base_url}/{file_name}"
-                if not _download_file(session, url, file_path):
-                    logger.error("Giving up on file %s", file_index)
-                    failures += 1
-                    continue
-                logger.info("File %s downloaded and saved", file_index)
-            else:
-                logger.info("File %s exists", file_index)
+            # One file per global grid. A missing grid degrades the hour to
+            # partial coverage rather than losing it; only both missing is a
+            # failure.
+            grid_paths: dict[str, str] = {}
+            for grid in GLOBAL_GRIDS:
+                file_name = f"gfswave.t{run_hour}z.{grid}.f{file_index}.grib2"
+                file_path = os.path.join(files_dir, file_name)
+                if not os.path.exists(file_path):
+                    url = f"{base_url}/{file_name}"
+                    if not _download_file(session, url, file_path):
+                        logger.error("Giving up on %s file %s", grid, file_index)
+                        continue
+                    logger.info("File %s (%s) downloaded and saved", file_index, grid)
+                else:
+                    logger.info("File %s (%s) exists", file_index, grid)
+                grid_paths[grid] = file_path
+            if not grid_paths:
+                failures += 1
+                continue
+            if len(grid_paths) < len(GLOBAL_GRIDS):
+                logger.warning(
+                    "File %s: only %s available; coverage will be partial",
+                    file_index,
+                    ", ".join(grid_paths),
+                )
 
             try:
-                data = extract_from_grib2_to_np(file_path)
+                extracted = {
+                    grid: extract_from_grib2_to_np(path)
+                    for grid, path in grid_paths.items()
+                }
+                data = composite_swell(
+                    extracted.get(GLOBAL_GRIDS[0]), extracted.get(GLOBAL_GRIDS[1])
+                )
                 calculate_contours4(
                     data,
                     geojson_path,
@@ -655,7 +685,13 @@ def process_forecast_hours(
                 extract_swell_arrows(data, arrows_path, stride=arrow_stride)
                 partition_path = os.path.join(files_dir, f"swell_partitions_{file_index}.geojson")
                 extract_partition_arrows(data, partition_path, stride=arrow_stride)
-                wind_data = extract_wind(file_path)
+                wind_extracted = {
+                    grid: extract_wind(path) for grid, path in grid_paths.items()
+                }
+                wind_data = composite_wind(
+                    wind_extracted.get(GLOBAL_GRIDS[0]),
+                    wind_extracted.get(GLOBAL_GRIDS[1]),
+                )
                 wind_path = os.path.join(files_dir, f"wind_{file_index}.geojson")
                 write_wind_arrows(wind_data, wind_path, stride=arrow_stride)
                 heatmap_path = os.path.join(
