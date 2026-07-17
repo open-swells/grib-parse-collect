@@ -27,6 +27,7 @@ from shapely.ops import transform as shapely_transform
 from scipy.ndimage import gaussian_filter
 
 from composite import composite_swell, composite_wind
+from nwps import process_nwps_domains
 from tides import write_tides
 from wind import extract_wind, write_wind_arrows
 
@@ -175,6 +176,7 @@ def render_heatmap_png(
     png_path: str,
     *,
     rows_scale: float = 2.0,
+    alpha: np.ndarray | None = None,
 ) -> dict:
     """Render the height field as a continuous-color PNG heatmap.
 
@@ -182,6 +184,11 @@ def render_heatmap_png(
     rows are resampled here from the equirectangular GRIB grid to equal
     Mercator spacing; displaying the PNG at the returned bounds then puts
     every pixel at the correct latitude. Land is transparent.
+
+    alpha, if given, is a per-cell 0..1 opacity multiplier (same shape as
+    the height grid) and switches the output from indexed-palette to RGBA —
+    the nearshore mosaics use it to feather their offshore edges into the
+    global layer underneath instead of cutting off in a hard line.
     """
     height = data["height"].astype(np.float32, copy=False)
     mask = data.get("height_mask")
@@ -192,6 +199,8 @@ def render_heatmap_png(
     if lats[0] < lats[-1]:  # rows must run north -> south for the image
         lats = lats[::-1]
         grid = grid[::-1, :]
+        if alpha is not None:
+            alpha = alpha[::-1, :]
 
     def merc_y(lat_deg: np.ndarray) -> np.ndarray:
         return np.log(np.tan(np.pi / 4 + np.radians(lat_deg) / 2))
@@ -228,11 +237,18 @@ def render_heatmap_png(
     indices = (1 + np.round(fraction * (steps - 1))).astype(np.uint8)
     indices[np.isnan(warped)] = 0
 
-    # fromarray yields mode "L"; putpalette converts it to "P" in place.
-    # (Passing mode= to fromarray is deprecated and gone in Pillow 13.)
-    image = PILImage.fromarray(indices)
-    image.putpalette(palette.flatten())
-    image.save(png_path, optimize=True, transparency=0)
+    if alpha is not None:
+        alpha_warped = np.clip(alpha, 0.0, 1.0)[src_rows, :]
+        alpha_bytes = np.round(alpha_warped * 255).astype(np.uint8)
+        alpha_bytes[indices == 0] = 0
+        rgba = np.dstack([palette[indices], alpha_bytes])
+        PILImage.fromarray(rgba).save(png_path, optimize=True)
+    else:
+        # fromarray yields mode "L"; putpalette converts it to "P" in place.
+        # (Passing mode= to fromarray is deprecated and gone in Pillow 13.)
+        image = PILImage.fromarray(indices)
+        image.putpalette(palette.flatten())
+        image.save(png_path, optimize=True, transparency=0)
     logger.info("Heatmap saved to %s (%dx%d)", png_path, indices.shape[1], indices.shape[0])
     return {
         "west": float(lons[0]),
@@ -586,6 +602,7 @@ def write_metadata(
     successes: int | None = None,
     failures: int | None = None,
     heatmap_bounds: dict | None = None,
+    nwps: dict | None = None,
 ) -> str:
     metadata_path = os.path.join(files_dir, "metadata.json")
     metadata: dict[str, object] = {
@@ -601,6 +618,15 @@ def write_metadata(
     if heatmap_bounds is not None:
         # The web app pins the heatmap PNGs to these corner coordinates.
         metadata["heatmap_bounds"] = heatmap_bounds
+    if nwps:
+        if nwps.get("layers"):
+            # Nearshore mosaic overlays: per-grid-tier bounds and which
+            # forecast hours have a nwps_<grid>_<HHH>.png frame.
+            metadata["nwps_layers"] = nwps["layers"]
+        if nwps.get("points"):
+            # Beach point grids: which 3-hourly hours have a
+            # nwps_points_<wfo>_<grid>_<HHH>.geojson file.
+            metadata["nwps_points"] = nwps["points"]
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
     logger.info("Saved metadata to %s", metadata_path)
@@ -865,6 +891,13 @@ def main() -> None:
             run_info=run_info,
         )
 
+        # Nearshore NWPS mosaics and beach point grids, aligned by valid
+        # time to the GFS run.
+        forecast_start = datetime.strptime(f"{date_str}{hour}", "%Y%m%d%H")
+        nwps = process_nwps_domains(
+            session, files_dir, forecast_start, hour_sequence, render_heatmap_png
+        )
+
         tide_stations = [
             station.strip()
             for station in os.environ.get("TIDE_STATIONS", "").split(",")
@@ -890,6 +923,7 @@ def main() -> None:
             successes=successes,
             failures=failures,
             heatmap_bounds=run_info.get("heatmap_bounds"),
+            nwps=nwps,
         )
 
         total = successes + failures

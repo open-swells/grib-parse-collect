@@ -25,6 +25,11 @@ SSH_KEY_PATH=/etc/ssh/ssh_host_ed25519_key
 PARALLEL_HOURS=3               # optional: worker processes for forecast hours
                                # (default: cores-1, capped at 4; each worker
                                # holds a few hundred MB of grids)
+NWPS_DOMAINS=wr/lox,wr/sgx     # optional: NWPS nearshore domains as
+                               # region/wfo pairs (this is the default;
+                               # set empty to disable nearshore layers)
+NWPS_GRIDS=CG1                 # optional: CG1 (~4 km full domain) and/or
+                               # nested CG2+ (~500 m bays), e.g. CG1,CG2
 ```
 
 **Source grids**: every layer is a composite of two NOAA GFS-Wave products —
@@ -51,6 +56,22 @@ the hour degrades to partial coverage instead of failing.
 - `wind_XXX.geojson` (+`.gz`) — surface wind points from the GFS-Wave file.
   Properties are `s` speed in m/s, `d` direction from in degrees true, and
   `u`/`v` components in m/s.
+- `nwps_<grid>_XXX.png` (e.g. `nwps_cg1_012.png`) — nearshore combined
+  wave height from NOAA NWPS (SWAN), all configured office domains
+  mosaicked onto one lattice at the finest source resolution (finer
+  grids blend in over coarser ones across overlaps; the offshore edge is
+  alpha-feathered so the frame fades into the global heatmap under it).
+  Named by the same global forecast hour as `heatmap_XXX.png` — overlay
+  directly. `metadata.json` lists bounds and covered hours per grid tier
+  under `nwps_layers` (max 144 h; hours before the office's cycle or past
+  its horizon have no frame and the global layer shows through).
+- `nwps_points_<wfo>_<grid>_XXX.geojson` (+`.gz`) — every wet NWPS cell
+  as a point, 3-hourly out to 144 h, for high-resolution beach forecasts.
+  Compact properties `h` (combined wind-wave-and-swell height m — total
+  sea state, not a swell partition), `s` (total swell height m, wind sea
+  excluded — use this for "swell"), `p` (primary mean period s), `d`
+  (primary direction from, deg true). Listed per domain under
+  `nwps_points` in `metadata.json`.
 - `tides.json` — NOAA CO-OPS hourly astronomical predictions and the latest
   48 hours of observed water levels, in meters relative to MLLW and UTC.
   Set `TIDE_STATIONS` to comma-separated CO-OPS station IDs to generate it,

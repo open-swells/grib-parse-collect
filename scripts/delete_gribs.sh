@@ -18,6 +18,7 @@ find "$FILES_DIR" -type f -name '*.geojson' -delete
 find "$FILES_DIR" -type f -name '*.geojson.gz' -delete
 echo "All .geojson files have been deleted."
 find "$FILES_DIR" -type f -name 'heatmap_*.png' -delete
+find "$FILES_DIR" -type f -name 'nwps_*.png' -delete
 echo "All heatmap .png files have been deleted."
 find "$FILES_DIR" -type f -name '*.csv' -delete
 echo "All .csv files have been deleted."
