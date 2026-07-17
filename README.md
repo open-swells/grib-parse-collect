@@ -16,7 +16,7 @@ sudo systemctl start my_python_script.timer
 **necessary .env: **
 ```
 SOURCE_PATH=...../grib-parse-collect/files
-DEST_PATH=<server>/open-swells-app/static
+DEST_PATH=<user>@<app-server>:/root/open-swells-app/data/forecast/
 PYTHON_SCRIPT=....../grib-parse-collect/gfs_to_contours.py
 PYTHON_INTERPRETER=...../bin/python3
 FILES_DIR=....../grib-parse-collect/files
@@ -82,9 +82,13 @@ See `../webgl-swell-rendering.md` for the possible next step (client-side
 WebGL rendering with temporal interpolation).
 
 `run.sh --verbose` draws a live progress bar in the terminal (the log is
-unaffected); `--local` copies output to the sibling open-swells-app instead
-of the server; `--limit <n>` processes only the first n forecast hours for
-quick render checks (don't publish a limited run to the server).
+unaffected); `--local` copies output to the sibling
+`open-swells-app/data/forecast` directory instead of the server. Override that
+location for a one-off run with `LOCAL_DEST_PATH=/path/to/data/forecast`.
+`--limit <n>` processes only the first n forecast hours for quick render checks
+(don't publish a limited run to the server). The application should set
+`FORECAST_DIR='./data/forecast'` so it reads the generated files from the same
+location.
 
 **Optional tuning env vars**:
 ```

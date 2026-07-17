@@ -3,7 +3,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOCAL=false
 VERBOSE=false
 LIMIT=0
-LOCAL_DEST_PATH="${LOCAL_DEST_PATH:-"$SCRIPT_DIR/../open-swells-app/static"}"
+LOCAL_DEST_PATH="${LOCAL_DEST_PATH:-"$SCRIPT_DIR/../open-swells-app/data/forecast"}"
 
 usage() {
     echo "Usage: $0 [--local] [--verbose] [--limit <n>]"
