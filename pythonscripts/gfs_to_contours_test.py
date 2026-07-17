@@ -40,7 +40,7 @@ def main() -> None:
             stride=stride,
             smoothing_sigma=smoothing_sigma,
             simplify_tolerance=simplify_tolerance,
-            session=session,
+            workers=1,
         )
 
 

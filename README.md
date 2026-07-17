@@ -22,6 +22,9 @@ PYTHON_INTERPRETER=...../bin/python3
 FILES_DIR=....../grib-parse-collect/files
 LOG_DIR=...../grib-parse-collect/logs
 SSH_KEY_PATH=/etc/ssh/ssh_host_ed25519_key
+PARALLEL_HOURS=3               # optional: worker processes for forecast hours
+                               # (default: cores-1, capped at 4; each worker
+                               # holds a few hundred MB of grids)
 ```
 
 **Source grids**: every layer is a composite of two NOAA GFS-Wave products —

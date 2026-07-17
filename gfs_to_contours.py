@@ -4,7 +4,9 @@ import json
 import logging
 import logging.handlers
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta
+from functools import partial
 import datetime as dt
 
 import numpy as np
@@ -605,6 +607,116 @@ def write_metadata(
     return metadata_path
 
 
+def _process_single_hour(
+    forecast_hour,
+    date_str: str,
+    run_hour: str,
+    files_dir: str,
+    *,
+    stride: int = 1,
+    smoothing_sigma: float = 1.5,
+    simplify_tolerance: float | None = 0.02,
+    arrow_stride: int = 10,
+) -> tuple[str, bool, dict | None]:
+    """Download and render one forecast hour; runs in a worker process.
+
+    Returns (file_index, succeeded, heatmap_bounds). Never raises: hours are
+    independent, so one bad hour must not take down the pool.
+    """
+    base_url = (
+        "https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/"
+        f"gfs.{date_str}/{run_hour}/wave/gridded"
+    )
+    file_index = f"{int(forecast_hour):03}"
+    geojson_path = os.path.join(files_dir, f"contours_{file_index}.geojson")
+
+    # One file per global grid. A missing grid degrades the hour to partial
+    # coverage rather than losing it; only both missing is a failure.
+    grid_paths: dict[str, str] = {}
+    with requests.Session() as session:
+        for grid in GLOBAL_GRIDS:
+            file_name = f"gfswave.t{run_hour}z.{grid}.f{file_index}.grib2"
+            file_path = os.path.join(files_dir, file_name)
+            if not os.path.exists(file_path):
+                url = f"{base_url}/{file_name}"
+                if not _download_file(session, url, file_path):
+                    logger.error("Giving up on %s file %s", grid, file_index)
+                    continue
+                logger.info("File %s (%s) downloaded and saved", file_index, grid)
+            else:
+                logger.info("File %s (%s) exists", file_index, grid)
+            grid_paths[grid] = file_path
+    if not grid_paths:
+        return file_index, False, None
+    if len(grid_paths) < len(GLOBAL_GRIDS):
+        logger.warning(
+            "File %s: only %s available; coverage will be partial",
+            file_index,
+            ", ".join(grid_paths),
+        )
+
+    try:
+        extracted = {
+            grid: extract_from_grib2_to_np(path)
+            for grid, path in grid_paths.items()
+        }
+        data = composite_swell(
+            extracted.get(GLOBAL_GRIDS[0]), extracted.get(GLOBAL_GRIDS[1])
+        )
+        calculate_contours4(
+            data,
+            geojson_path,
+            stride=stride,
+            smoothing_sigma=smoothing_sigma,
+            simplify_tolerance=simplify_tolerance,
+            extra_properties={"forecast_hour": int(forecast_hour)},
+        )
+        arrows_path = os.path.join(files_dir, f"arrows_{file_index}.geojson")
+        extract_swell_arrows(data, arrows_path, stride=arrow_stride)
+        partition_path = os.path.join(files_dir, f"swell_partitions_{file_index}.geojson")
+        extract_partition_arrows(data, partition_path, stride=arrow_stride)
+        wind_extracted = {
+            grid: extract_wind(path) for grid, path in grid_paths.items()
+        }
+        wind_data = composite_wind(
+            wind_extracted.get(GLOBAL_GRIDS[0]),
+            wind_extracted.get(GLOBAL_GRIDS[1]),
+        )
+        wind_path = os.path.join(files_dir, f"wind_{file_index}.geojson")
+        write_wind_arrows(wind_data, wind_path, stride=arrow_stride)
+        heatmap_path = os.path.join(files_dir, f"heatmap_{file_index}.png")
+        bounds = render_heatmap_png(data, heatmap_path)
+        return file_index, True, bounds
+    except Exception as exc:
+        logger.error("Error processing file %s: %s", file_index, exc, exc_info=True)
+        return file_index, False, None
+
+
+def _worker_init() -> None:
+    """Attach log handlers in pool workers.
+
+    With the default fork start method the workers inherit the parent's
+    handlers and this is a no-op; under spawn/forkserver it recreates them.
+    Multiple processes appending to the same log file is safe enough here
+    (O_APPEND, small writes); lines may interleave but are not lost.
+    """
+    log_dir = os.environ.get("LOG_DIR")
+    if log_dir:
+        setup_logging(log_dir)
+
+
+def default_workers() -> int:
+    """Worker count from PARALLEL_HOURS, else a memory-conscious default.
+
+    Each worker holds a few hundred MB of grids, so cap the default at 4
+    even on wide machines; set PARALLEL_HOURS explicitly to go higher.
+    """
+    env_value = os.environ.get("PARALLEL_HOURS")
+    if env_value:
+        return max(1, int(env_value))
+    return max(1, min(4, (os.cpu_count() or 2) - 1))
+
+
 def process_forecast_hours(
     hour_sequence,
     date_str: str,
@@ -615,103 +727,72 @@ def process_forecast_hours(
     smoothing_sigma: float = 1.5,
     simplify_tolerance: float | None = 0.02,
     arrow_stride: int = 10,
-    session: requests.Session | None = None,
+    workers: int | None = None,
     run_info: dict | None = None,
 ) -> tuple[int, int]:
-    base_url = (
-        "https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/"
-        f"gfs.{date_str}/{run_hour}/wave/gridded"
-    )
+    """Process all forecast hours, fanning out over a process pool.
 
-    own_session = False
-    if session is None:
-        session = requests.Session()
-        own_session = True
+    Hours are fully independent (own downloads, own output files), so they
+    are distributed across worker processes; workers=1 runs inline in this
+    process, which keeps a simple path for debugging and tests.
+    """
+    hours = list(hour_sequence)
+    if workers is None:
+        workers = default_workers()
+    workers = max(1, min(workers, len(hours) or 1))
+    # partial() pickles by reference to the module-level function, so the
+    # same callable serves both the inline and the pool path.
+    process_hour = partial(
+        _process_single_hour,
+        date_str=date_str,
+        run_hour=run_hour,
+        files_dir=files_dir,
+        stride=stride,
+        smoothing_sigma=smoothing_sigma,
+        simplify_tolerance=simplify_tolerance,
+        arrow_stride=arrow_stride,
+    )
+    if workers > 1:
+        logger.info("Processing %d forecast hours with %d workers", len(hours), workers)
 
     successes = 0
     failures = 0
-    hours = list(hour_sequence)
-    try:
-        for done, forecast_hour in enumerate(hours, start=1):
-            file_index = f"{int(forecast_hour):03}"
-            _print_progress(done - 1, len(hours), f"f{file_index}")
-            geojson_path = os.path.join(files_dir, f"contours_{file_index}.geojson")
+    bounds_by_position: dict[int, dict] = {}
 
-            # One file per global grid. A missing grid degrades the hour to
-            # partial coverage rather than losing it; only both missing is a
-            # failure.
-            grid_paths: dict[str, str] = {}
-            for grid in GLOBAL_GRIDS:
-                file_name = f"gfswave.t{run_hour}z.{grid}.f{file_index}.grib2"
-                file_path = os.path.join(files_dir, file_name)
-                if not os.path.exists(file_path):
-                    url = f"{base_url}/{file_name}"
-                    if not _download_file(session, url, file_path):
-                        logger.error("Giving up on %s file %s", grid, file_index)
-                        continue
-                    logger.info("File %s (%s) downloaded and saved", file_index, grid)
-                else:
-                    logger.info("File %s (%s) exists", file_index, grid)
-                grid_paths[grid] = file_path
-            if not grid_paths:
-                failures += 1
-                continue
-            if len(grid_paths) < len(GLOBAL_GRIDS):
-                logger.warning(
-                    "File %s: only %s available; coverage will be partial",
-                    file_index,
-                    ", ".join(grid_paths),
-                )
+    def tally(
+        result: tuple[str, bool, dict | None], done: int, position: int
+    ) -> None:
+        nonlocal successes, failures
+        file_index, succeeded, bounds = result
+        if succeeded:
+            successes += 1
+            if bounds is not None:
+                bounds_by_position[position] = bounds
+        else:
+            failures += 1
+        _print_progress(done, len(hours), f"f{file_index}")
 
-            try:
-                extracted = {
-                    grid: extract_from_grib2_to_np(path)
-                    for grid, path in grid_paths.items()
-                }
-                data = composite_swell(
-                    extracted.get(GLOBAL_GRIDS[0]), extracted.get(GLOBAL_GRIDS[1])
-                )
-                calculate_contours4(
-                    data,
-                    geojson_path,
-                    stride=stride,
-                    smoothing_sigma=smoothing_sigma,
-                    simplify_tolerance=simplify_tolerance,
-                    extra_properties={"forecast_hour": int(forecast_hour)},
-                )
-                arrows_path = os.path.join(
-                    files_dir, f"arrows_{file_index}.geojson"
-                )
-                extract_swell_arrows(data, arrows_path, stride=arrow_stride)
-                partition_path = os.path.join(files_dir, f"swell_partitions_{file_index}.geojson")
-                extract_partition_arrows(data, partition_path, stride=arrow_stride)
-                wind_extracted = {
-                    grid: extract_wind(path) for grid, path in grid_paths.items()
-                }
-                wind_data = composite_wind(
-                    wind_extracted.get(GLOBAL_GRIDS[0]),
-                    wind_extracted.get(GLOBAL_GRIDS[1]),
-                )
-                wind_path = os.path.join(files_dir, f"wind_{file_index}.geojson")
-                write_wind_arrows(wind_data, wind_path, stride=arrow_stride)
-                heatmap_path = os.path.join(
-                    files_dir, f"heatmap_{file_index}.png"
-                )
-                bounds = render_heatmap_png(data, heatmap_path)
-                if run_info is not None:
-                    run_info.setdefault("heatmap_bounds", bounds)
-                successes += 1
-            except Exception as exc:
-                failures += 1
-                logger.error(
-                    "Error processing file %s: %s", file_index, exc, exc_info=True
-                )
-        _print_progress(
-            len(hours), len(hours), f"done ({failures} failed)" if failures else "done"
-        )
-    finally:
-        if own_session:
-            session.close()
+    if workers == 1:
+        for position, forecast_hour in enumerate(hours):
+            tally(process_hour(forecast_hour), position + 1, position)
+    else:
+        with ProcessPoolExecutor(
+            max_workers=workers, initializer=_worker_init
+        ) as pool:
+            futures = {
+                pool.submit(process_hour, forecast_hour): position
+                for position, forecast_hour in enumerate(hours)
+            }
+            for done, future in enumerate(as_completed(futures), start=1):
+                tally(future.result(), done, futures[future])
+
+    if run_info is not None and bounds_by_position:
+        first_position = min(bounds_by_position)
+        run_info.setdefault("heatmap_bounds", bounds_by_position[first_position])
+
+    _print_progress(
+        len(hours), len(hours), f"done ({failures} failed)" if failures else "done"
+    )
     return successes, failures
 
 
@@ -760,8 +841,10 @@ def main() -> None:
             "Found latest GFS wave data for date %s hour %sZ", date_str, hour
         )
         run_info: dict = {}
-        # One combined sequence so the --verbose progress bar spans the run.
-        hour_sequence = list(range(0, 121, 3)) + list(range(123, 387, 3))
+        # NOAA publishes the wave grids hourly out to f120 (5 days), then
+        # 3-hourly to f384. One combined sequence so the --verbose progress
+        # bar spans the run.
+        hour_sequence = list(range(0, 121)) + list(range(123, 387, 3))
         # run.sh --limit <n>: only the first n hours, for quick local checks.
         limit = int(os.environ.get("GRIB_LIMIT", "0") or 0)
         if limit > 0:
@@ -779,7 +862,6 @@ def main() -> None:
             smoothing_sigma=smoothing_sigma,
             simplify_tolerance=simplify_tolerance,
             arrow_stride=arrow_stride,
-            session=session,
             run_info=run_info,
         )
 
