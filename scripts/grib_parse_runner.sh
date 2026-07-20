@@ -26,6 +26,22 @@ for var in PYTHON_SCRIPT FILES_DIR LOG_DIR; do
     fi
 done
 
+# This directory is emptied before every run. Resolve symlinks and `..` first,
+# then require the result to remain strictly below the project root. This keeps
+# a typo such as FILES_DIR=/ (or an external directory) from becoming a
+# destructive cleanup target.
+CANONICAL_PROJECT_ROOT="$(realpath -e "$PROJECT_ROOT")"
+CANONICAL_FILES_DIR="$(realpath -m "$FILES_DIR")"
+case "$CANONICAL_FILES_DIR" in
+    "$CANONICAL_PROJECT_ROOT"/*)
+        FILES_DIR="$CANONICAL_FILES_DIR"
+        ;;
+    *)
+        echo "Error: FILES_DIR must be a child of $CANONICAL_PROJECT_ROOT; got $CANONICAL_FILES_DIR" >&2
+        exit 1
+        ;;
+esac
+
 if [ ! -f "$PYTHON_SCRIPT" ]; then
     alt_path="$PROJECT_ROOT/$PYTHON_SCRIPT"
     if [ -f "$alt_path" ]; then

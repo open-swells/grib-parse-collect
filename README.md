@@ -21,7 +21,7 @@ PYTHON_SCRIPT=....../grib-parse-collect/gfs_to_contours.py
 PYTHON_INTERPRETER=...../bin/python3
 FILES_DIR=....../grib-parse-collect/files
 LOG_DIR=...../grib-parse-collect/logs
-SSH_KEY_PATH=/etc/ssh/ssh_host_ed25519_key
+SSH_KEY_PATH=...../.ssh/openswells_deploy_ed25519
 PARALLEL_HOURS=3               # optional: worker processes for forecast hours
                                # (default: cores-1, capped at 4; each worker
                                # holds a few hundred MB of grids)
@@ -31,6 +31,16 @@ NWPS_DOMAINS=wr/lox,wr/sgx     # optional: NWPS nearshore domains as
 NWPS_GRIDS=CG1                 # optional: CG1 (~4 km full domain) and/or
                                # nested CG2+ (~500 m bays), e.g. CG1,CG2
 ```
+
+`SSH_KEY_PATH` must refer to a dedicated deployment key. Do not use an SSH
+server host key (such as `/etc/ssh/ssh_host_ed25519_key`) or a personal key
+that is also used for other accounts. Restrict the corresponding server-side
+key to the forecast upload destination and operations it actually needs.
+
+`FILES_DIR` is erased at the beginning of a run and therefore must resolve to
+a child directory of this repository. The runner rejects `/`, the repository
+root itself, paths outside the repository, and symlinks that resolve outside
+it.
 
 **Source grids**: every layer is a composite of two NOAA GFS-Wave products —
 `global.0p16` (1/6°, but only 15S–52.5N) inside its band and `global.0p25`
