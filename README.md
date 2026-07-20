@@ -16,7 +16,7 @@ sudo systemctl start my_python_script.timer
 **necessary .env: **
 ```
 SOURCE_PATH=...../grib-parse-collect/files
-DEST_PATH=<user>@<app-server>:/root/open-swells-app/data/forecast/
+DEST_PATH=<user>@<app-server>:/var/lib/open-swells/forecast/
 PYTHON_SCRIPT=....../grib-parse-collect/gfs_to_contours.py
 PYTHON_INTERPRETER=...../bin/python3
 FILES_DIR=....../grib-parse-collect/files
