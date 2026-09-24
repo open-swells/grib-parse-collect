@@ -9,9 +9,9 @@ import gfs_to_contours
 class ProcessForecastHoursTests(unittest.TestCase):
     def test_tally_and_first_bounds_published(self):
         results = {
-            0: ("000", True, {"north": 85.0}),
-            3: ("003", False, None),
-            6: ("006", True, {"north": 42.0}),
+            0: ("000", True, {"north": 85.0}, None),
+            3: ("003", False, None, None),
+            6: ("006", True, {"north": 42.0}, None),
         }
 
         def fake_hour(forecast_hour, **kwargs):
@@ -33,9 +33,9 @@ class ProcessForecastHoursTests(unittest.TestCase):
         def fake_hour(forecast_hour, **kwargs):
             if forecast_hour == 0:
                 self.assertTrue(later_hour_finished.wait(timeout=1))
-                return ("000", True, {"north": 85.0})
+                return ("000", True, {"north": 85.0}, None)
             later_hour_finished.set()
-            return ("003", True, {"north": 42.0})
+            return ("003", True, {"north": 42.0}, None)
 
         run_info = {}
         with (
@@ -54,7 +54,7 @@ class ProcessForecastHoursTests(unittest.TestCase):
 
         def fake_hour(forecast_hour, **kwargs):
             seen.update(kwargs)
-            return ("000", True, None)
+            return ("000", True, None, None)
 
         with patch.object(gfs_to_contours, "_process_single_hour", fake_hour):
             gfs_to_contours.process_forecast_hours(

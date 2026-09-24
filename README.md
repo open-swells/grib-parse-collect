@@ -30,6 +30,9 @@ NWPS_DOMAINS=wr/lox,wr/sgx     # optional: NWPS nearshore domains as
                                # set empty to disable nearshore layers)
 NWPS_GRIDS=CG1                 # optional: CG1 (~4 km full domain) and/or
                                # nested CG2+ (~500 m bays), e.g. CG1,CG2
+SPOTS_PATH=...../spots.json    # optional: surf spots to sample into
+                               # spot_forecasts.json.gz (default:
+                               # spots.json in this repository)
 ```
 
 `SSH_KEY_PATH` must refer to a dedicated deployment key. Do not use an SSH
@@ -82,6 +85,21 @@ the hour degrades to partial coverage instead of failing.
   excluded — use this for "swell"), `p` (primary mean period s), `d`
   (primary direction from, deg true). Listed per domain under
   `nwps_points` in `metadata.json`.
+- `spot_forecasts.json.gz` — one file per run (not per hour): every
+  surf spot in the web app's `spots.json` sampled at its nearest wet cell
+  of the full-resolution 1/6° composite (great-circle distance, within
+  100 km; lakes, rivers and unmodeled seas are left out), for every
+  forecast hour. Arrays align with the top-level `hours` list; `null`
+  marks a failed hour. Fields are `hs` (combined height m), `h1`/`p1`/`d1`
+  through `h3`/`p3`/`d3` (swell partitions, as above) and `ws`/`wd` (wind
+  m/s, direction from). Each spot also records the sampled `cell`
+  `[lat, lon]` and its distance `km`. See `spot_forecasts.py` for the
+  full layout; `metadata.json` summarizes it under `spot_forecasts`.
+  Spots are read from `spots.json` in this repository, a copy of the web
+  app's `data/spots.json` — update both together when spots change (a
+  spot missing here just falls back to the app's coarse sampling).
+  `SPOTS_PATH` overrides the location; if the file is missing the run
+  continues without spot forecasts.
 - `tides.json` — NOAA CO-OPS hourly astronomical predictions and the latest
   48 hours of observed water levels, in meters relative to MLLW and UTC.
   Set `TIDE_STATIONS` to comma-separated CO-OPS station IDs to generate it,

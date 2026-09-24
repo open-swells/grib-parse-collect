@@ -47,6 +47,9 @@ shopt -u nullglob
 if [ -f "$SOURCE_PATH/tides.json" ]; then
     contour_files+=("$SOURCE_PATH/tides.json")
 fi
+if [ -f "$SOURCE_PATH/spot_forecasts.json.gz" ]; then
+    contour_files+=("$SOURCE_PATH/spot_forecasts.json.gz")
+fi
 
 if [ ${#contour_files[@]} -gt 0 ]; then
     # --delay-updates stages everything in a temp dir on the server and renames

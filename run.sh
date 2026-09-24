@@ -65,6 +65,9 @@ copy_files_locally() {
     if [ -f "$source_path/tides.json" ]; then
         contour_files+=("$source_path/tides.json")
     fi
+    if [ -f "$source_path/spot_forecasts.json.gz" ]; then
+        contour_files+=("$source_path/spot_forecasts.json.gz")
+    fi
 
     if [ ${#contour_files[@]} -gt 0 ]; then
         echo "Copying ${#contour_files[@]} contour files from $source_path to $dest_path"

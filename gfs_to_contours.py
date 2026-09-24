@@ -28,6 +28,7 @@ from scipy.ndimage import gaussian_filter
 
 from composite import composite_swell, composite_wind
 from nwps import process_nwps_domains
+from spot_forecasts import load_spots, sample_spots, write_spot_forecasts
 from tides import write_tides
 from wind import extract_wind, write_wind_arrows
 
@@ -603,6 +604,7 @@ def write_metadata(
     failures: int | None = None,
     heatmap_bounds: dict | None = None,
     nwps: dict | None = None,
+    spot_forecasts: dict | None = None,
 ) -> str:
     metadata_path = os.path.join(files_dir, "metadata.json")
     metadata: dict[str, object] = {
@@ -627,6 +629,9 @@ def write_metadata(
             # Beach point grids: which 3-hourly hours have a
             # nwps_points_<wfo>_<grid>_<HHH>.geojson file.
             metadata["nwps_points"] = nwps["points"]
+    if spot_forecasts:
+        # Per-spot hourly series sampled at full grid resolution.
+        metadata["spot_forecasts"] = spot_forecasts
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
     logger.info("Saved metadata to %s", metadata_path)
@@ -643,11 +648,14 @@ def _process_single_hour(
     smoothing_sigma: float = 1.5,
     simplify_tolerance: float | None = 0.02,
     arrow_stride: int = 10,
-) -> tuple[str, bool, dict | None]:
+    spots: tuple[np.ndarray, np.ndarray] | None = None,
+) -> tuple[str, bool, dict | None, dict | None]:
     """Download and render one forecast hour; runs in a worker process.
 
-    Returns (file_index, succeeded, heatmap_bounds). Never raises: hours are
-    independent, so one bad hour must not take down the pool.
+    Returns (file_index, succeeded, heatmap_bounds, spot_samples), where
+    spot_samples is the sample_spots() result for the (lats, lons) in
+    spots, or None. Never raises: hours are independent, so one bad hour
+    must not take down the pool.
     """
     base_url = (
         "https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/"
@@ -673,7 +681,7 @@ def _process_single_hour(
                 logger.info("File %s (%s) exists", file_index, grid)
             grid_paths[grid] = file_path
     if not grid_paths:
-        return file_index, False, None
+        return file_index, False, None, None
     if len(grid_paths) < len(GLOBAL_GRIDS):
         logger.warning(
             "File %s: only %s available; coverage will be partial",
@@ -712,10 +720,19 @@ def _process_single_hour(
         write_wind_arrows(wind_data, wind_path, stride=arrow_stride)
         heatmap_path = os.path.join(files_dir, f"heatmap_{file_index}.png")
         bounds = render_heatmap_png(data, heatmap_path)
-        return file_index, True, bounds
     except Exception as exc:
         logger.error("Error processing file %s: %s", file_index, exc, exc_info=True)
-        return file_index, False, None
+        return file_index, False, None, None
+
+    # Spot sampling is an add-on: a failure here loses this hour's spot
+    # values, not the map layers already written.
+    spot_samples = None
+    if spots is not None:
+        try:
+            spot_samples = sample_spots(data, wind_data, *spots)
+        except Exception as exc:
+            logger.error("Spot sampling failed for %s: %s", file_index, exc, exc_info=True)
+    return file_index, True, bounds, spot_samples
 
 
 def _worker_init() -> None:
@@ -755,12 +772,16 @@ def process_forecast_hours(
     arrow_stride: int = 10,
     workers: int | None = None,
     run_info: dict | None = None,
+    spots: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> tuple[int, int]:
     """Process all forecast hours, fanning out over a process pool.
 
     Hours are fully independent (own downloads, own output files), so they
     are distributed across worker processes; workers=1 runs inline in this
     process, which keeps a simple path for debugging and tests.
+
+    With spots (lats, lons), each hour's spot samples are collected into
+    run_info["spot_samples"], keyed by position in hour_sequence.
     """
     hours = list(hour_sequence)
     if workers is None:
@@ -777,6 +798,7 @@ def process_forecast_hours(
         smoothing_sigma=smoothing_sigma,
         simplify_tolerance=simplify_tolerance,
         arrow_stride=arrow_stride,
+        spots=spots,
     )
     if workers > 1:
         logger.info("Processing %d forecast hours with %d workers", len(hours), workers)
@@ -784,16 +806,19 @@ def process_forecast_hours(
     successes = 0
     failures = 0
     bounds_by_position: dict[int, dict] = {}
+    spot_samples: dict[int, dict] = {}
 
     def tally(
-        result: tuple[str, bool, dict | None], done: int, position: int
+        result: tuple[str, bool, dict | None, dict | None], done: int, position: int
     ) -> None:
         nonlocal successes, failures
-        file_index, succeeded, bounds = result
+        file_index, succeeded, bounds, samples = result
         if succeeded:
             successes += 1
             if bounds is not None:
                 bounds_by_position[position] = bounds
+            if samples is not None:
+                spot_samples[position] = samples
         else:
             failures += 1
         _print_progress(done, len(hours), f"f{file_index}")
@@ -815,6 +840,8 @@ def process_forecast_hours(
     if run_info is not None and bounds_by_position:
         first_position = min(bounds_by_position)
         run_info.setdefault("heatmap_bounds", bounds_by_position[first_position])
+    if run_info is not None and spot_samples:
+        run_info["spot_samples"] = spot_samples
 
     _print_progress(
         len(hours), len(hours), f"done ({failures} failed)" if failures else "done"
@@ -861,6 +888,20 @@ def main() -> None:
     simplify_tolerance = float(simplify_env) if simplify_env else 0.02
     arrow_stride = max(int(os.environ.get("ARROW_STRIDE", "10") or 10), 1)
 
+    # Surf spots to sample (a copy of the web app's data/spots.json kept in
+    # this repo); spot forecasts are skipped, not fatal, if it is missing.
+    spots_path = os.environ.get("SPOTS_PATH") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "spots.json"
+    )
+    spot_ids: list[str] = []
+    spot_points = None
+    try:
+        spot_ids, spot_lats, spot_lons = load_spots(spots_path)
+        spot_points = (spot_lats, spot_lons)
+        logger.info("Loaded %d spots from %s", len(spot_ids), spots_path)
+    except (OSError, ValueError, KeyError) as exc:
+        logger.warning("Spot forecasts disabled; cannot load %s: %s", spots_path, exc)
+
     with requests.Session() as session:
         date_str, hour = find_latest_gfs_time(session=session)
         logger.info(
@@ -889,7 +930,21 @@ def main() -> None:
             simplify_tolerance=simplify_tolerance,
             arrow_stride=arrow_stride,
             run_info=run_info,
+            spots=spot_points,
         )
+
+        spot_forecasts = None
+        if run_info.get("spot_samples"):
+            try:
+                spot_forecasts = write_spot_forecasts(
+                    files_dir,
+                    spot_ids,
+                    hour_sequence,
+                    run_info.pop("spot_samples"),
+                    f"{date_str}_{hour}Z",
+                )
+            except Exception as exc:
+                logger.error("Writing spot forecasts failed: %s", exc, exc_info=True)
 
         # Nearshore NWPS mosaics and beach point grids, aligned by valid
         # time to the GFS run.
@@ -924,6 +979,7 @@ def main() -> None:
             failures=failures,
             heatmap_bounds=run_info.get("heatmap_bounds"),
             nwps=nwps,
+            spot_forecasts=spot_forecasts,
         )
 
         total = successes + failures
